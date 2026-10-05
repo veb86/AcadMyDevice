@@ -19,6 +19,8 @@
 #include "acutads.h"
 #include "dbmain.h"
 #include "dbsymtb.h"
+#include "dbents.h"
+#include "dbdynblk.h"
 #include "dbsymutl.h"
 #include "dbapserv.h"
 #include "dbfiler.h"

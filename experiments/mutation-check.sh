@@ -48,5 +48,26 @@ mutate MyDeviceProperties.cpp 's/if (!hasTextStyle(databaseOf(device), value))/i
 mutate MyDeviceProperties.cpp 's/if (!pRecord->isShapeFile() && /if (/' "формы SHAPE в списке шрифтов"
 mutate acrxEntryPoint.cpp 's/^        registerMyDeviceProperties();/        ;/' "свойства палитры не регистрируются"
 mutate acrxEntryPoint.cpp '/^        unregisterMyDeviceProperties();/d;s/^        deleteAcRxClass(MyDevice::desc());/&\n        unregisterMyDeviceProperties();/' "свойства удаляются после удаления класса"
+# Этап 3: блок и Visibility
+mutate MyDevice.cpp 's/if (version >= 3)/if (version > 3)/' "BlockName/Visibility не читаются из DWG"
+mutate MyDevice.cpp 's/^    pFiler->writeString(m_visibility);/    pFiler->writeString(m_blockName);/' "Visibility не сохраняется в DWG"
+mutate MyDevice.cpp 's/            visibility = rb.resval.rstring;/            blockName = rb.resval.rstring;/' "Visibility читается в BlockName (DXF)"
+mutate MyDevice.cpp 's/AcGeMatrix3d::translation(AcGePoint3d::kOrigin - info.origin)/AcGeMatrix3d::translation(info.origin - info.origin)/' "базовая точка блока не в начале координат MyDevice"
+mutate MyDevice.cpp 's/return localToWorld() \* AcGeMatrix3d::translation/return AcGeMatrix3d::translation/' "блок не следует за перемещением и поворотом"
+mutate MyDevice.cpp 's/^    drawBlock(pWd, pDb);/    (void)0;/' "блок не рисуется"
+mutate MyDevice.cpp 's/^        drawText(pWd, pDb, message);/        (void)message;/' "нет надписи BLOCK NOT FOUND"
+mutate MyDevice.cpp 's/AcString visibility = info.hasVisibility ? info.states.front().name : AcString();/AcString visibility = m_visibility;/' "смена BlockName не обновляет Visibility"
+mutate MyDevice.cpp 's/if (name == blockName() \&\& info.findState(m_visibility) >= 0)/if (false)/' "повторный выбор того же блока сбрасывает Visibility"
+mutate MyDevice.cpp 's/if (info.findState(state) < 0)/if (false)/' "Visibility принимает несуществующее состояние"
+mutate MyDevice.cpp 's/        pWd->subEntityTraits().setLayer(deviceLayerId);/        (void)0;/' "блок рисуется не на слое MyDevice"
+mutate MyDeviceBlock.cpp 's/info.hasVisibility = !info.states.empty();/info.hasVisibility = false;/' "параметр видимости не распознаётся"
+mutate MyDeviceBlock.cpp 's/return std::find(visible.begin(), visible.end(), id) != visible.end();/return std::find(visible.begin(), visible.end(), id) != visible.end() || true;/' "Visibility не скрывает примитивы"
+mutate MyDeviceBlock.cpp 's/if (std::find(controlled.begin(), controlled.end(), id) == controlled.end())/if (false)/' "неуправляемые примитивы скрыты"
+mutate MyDeviceBlock.cpp 's/if (AcDbAttributeDefinition::cast(pEntity) == nullptr/if (true/' "определения атрибутов рисуются"
+mutate MyDeviceBlock.cpp 's/return !pBlock->isLayout() \&\& /return /' "пространства модели и листов считаются блоками"
+mutate MyDeviceBlock.cpp 's/                pStart = pRb->rbnext;/                (void)0;/' "имя параметра берётся не из подкласса видимости"
+# Без защиты габариты вложенного MyDevice рекурсивны: тест завершается переполнением стека.
+mutate MyDeviceBlock.cpp 's/^    if (!guard.entered())/    if (false)/' "нет защиты от рекурсии блока"
+mutate MyDeviceBlock.cpp 's/^    pBlock->close();\n    return Acad::eOk;/X/;s/^    delete pIter;/    delete pIter; return Acad::eOk;/' "определение блока не закрывается"
 cmake --build build >/dev/null
 exit $status

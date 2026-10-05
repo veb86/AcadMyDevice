@@ -46,6 +46,7 @@ namespace Acad
     {
         eOk = 0,
         eNotApplicable = 3,
+        eNullObjectId = 5,
         eInvalidInput = 4,
         eNullObjectPointer = 9,
         eOutOfMemory = 11,
@@ -359,6 +360,8 @@ typedef double ads_real;
 typedef ads_real ads_point[3];
 enum { X = 0, Y = 1, Z = 2 };
 
+typedef Adesk::Int64 ads_name[2];
+
 #define RTNORM 5100
 #define RTCAN (-5002)
 
@@ -369,6 +372,7 @@ union ads_u_val
     short rint;
     ACHAR* rstring;
     Adesk::Int32 rlong;
+    Adesk::Int64 rlname[2];
 };
 
 struct resbuf
@@ -443,10 +447,19 @@ public:
     intptr_t value() const { return m_id; }
     bool operator==(const AcDbObjectId& other) const { return m_id == other.m_id; }
     bool operator!=(const AcDbObjectId& other) const { return m_id != other.m_id; }
+    bool operator<(const AcDbObjectId& other) const { return m_id < other.m_id; }
 
 private:
     intptr_t m_id;
 };
+
+// Список групп DXF объекта (acdbEntGet) и преобразование идентификаторов в ads_name.
+// В имитации ads_name — это идентификатор объекта; acdbEntGet возвращает группы,
+// заданные тестом через mock::setEntGet(). Список освобождается через acutRelRb().
+struct resbuf* acdbEntGet(const ads_name ent);
+int acutRelRb(struct resbuf* rb);
+Acad::ErrorStatus acdbGetAdsName(ads_name& objName, AcDbObjectId objId);
+Acad::ErrorStatus acdbGetObjectId(AcDbObjectId& objId, const ads_name objName);
 
 // ---------------------------------------------------------------------------
 // AcGi
@@ -498,10 +511,17 @@ public:
     virtual AcDbObjectId layerId() const = 0;
 };
 
+class AcGiDrawable;
+
 class AcGiWorldGeometry
 {
 public:
     virtual ~AcGiWorldGeometry() {}
+    // Матрица, применяемая ко всей последующей геометрии до popModelTransform().
+    virtual Adesk::Boolean pushModelTransform(const AcGeMatrix3d& xMat) = 0;
+    virtual Adesk::Boolean popModelTransform() = 0;
+    // Рисует вложенный объект (например, примитив определения блока).
+    virtual Adesk::Boolean draw(AcGiDrawable* pDrawable) const = 0;
     virtual Adesk::Boolean polyline(const Adesk::UInt32 nbPoints, const AcGePoint3d* pVertexList,
                                     const AcGeVector3d* pNormal = nullptr,
                                     Adesk::LongPtr lBaseSubEntMarker = -1) const = 0;
@@ -571,6 +591,11 @@ public:
     bool isKindOf(const AcRxClass* c) const { return isA() && isA()->isDerivedFrom(c); }
 };
 
+// Всё, что умеет рисовать себя через AcGi; в ObjectARX — база AcDbObject.
+class AcGiDrawable : public AcRxObject
+{
+};
+
 // Реестр классов (имитация acrxClassDictionary).
 AcRxClass* mockFindClass(const ACHAR* name);
 AcRxClass* newAcRxClass(const ACHAR* className, const ACHAR* parentClassName,
@@ -619,11 +644,19 @@ namespace AcRx
 // AcDb
 // ---------------------------------------------------------------------------
 
-class AcDbObject : public AcRxObject
+class AcDbObject : public AcGiDrawable
 {
 public:
     Acad::ErrorStatus close() { m_closeCount++; return Acad::eOk; }
     int closeCount() const { return m_closeCount; }
+    // Сколько раз имитация «открывала» объект (итераторы, getAt с указателем);
+    // у правильно закрытого объекта openCount() == closeCount().
+    int openCount() const { return m_openCount; }
+    void mockOpened() const { m_openCount++; }
+
+    // Словарь расширений объекта; пустой идентификатор, если его нет.
+    AcDbObjectId extensionDictionary() const { return m_extensionDictionary; }
+    void mockSetExtensionDictionary(AcDbObjectId id) { m_extensionDictionary = id; }
 
     AcDbDatabase* database() const { return m_pDatabase; }
     AcDbObjectId objectId() const { return m_id; }
@@ -642,8 +675,10 @@ protected:
 
 private:
     int m_closeCount;
+    mutable int m_openCount = 0;
     AcDbDatabase* m_pDatabase;
     AcDbObjectId m_id;
+    AcDbObjectId m_extensionDictionary;
 };
 
 class AcDbEntity : public AcDbObject
@@ -719,14 +754,44 @@ public:
 
 #define ACDB_MODEL_SPACE _T("*Model_Space")
 
-class AcDbBlockTableRecord : public AcDbObject
+// Отрезок (dbents.h) — простой примитив для наполнения определений блоков в тестах.
+class AcDbLine : public AcDbEntity
 {
 public:
-    ~AcDbBlockTableRecord() override;
-    AcRxClass* isA() const override { return nullptr; }
-    Acad::ErrorStatus appendAcDbEntity(AcDbObjectId& id, AcDbEntity* pEntity);
-    // Объекты, добавленные в запись; принадлежат записи и удаляются вместе с ней.
-    std::vector<AcDbEntity*> entities;
+    AcDbLine() {}
+    AcDbLine(const AcGePoint3d& start, const AcGePoint3d& end) : m_start(start), m_end(end) {}
+    AcGePoint3d startPoint() const { return m_start; }
+    AcGePoint3d endPoint() const { return m_end; }
+
+protected:
+    Adesk::Boolean subWorldDraw(AcGiWorldDraw* pWd) override;
+    Acad::ErrorStatus subGetGeomExtents(AcDbExtents& extents) const override;
+
+private:
+    AcGePoint3d m_start, m_end;
+};
+
+// Определение атрибута (dbents.h). Рисует свой тег, как в AutoCAD.
+class AcDbAttributeDefinition : public AcDbEntity
+{
+public:
+    static AcRxClass* desc();
+    AcRxClass* isA() const override { return desc(); }
+    static AcDbAttributeDefinition* cast(const AcRxObject* inPtr)
+    {
+        return (inPtr == nullptr || !inPtr->isKindOf(desc()))
+            ? nullptr : (AcDbAttributeDefinition*)inPtr;
+    }
+
+    explicit AcDbAttributeDefinition(const ACHAR* tag = L"TAG") : m_tag(tag) {}
+    const ACHAR* tagConst() const { return m_tag.c_str(); }
+
+protected:
+    Adesk::Boolean subWorldDraw(AcGiWorldDraw* pWd) override;
+    Acad::ErrorStatus subGetGeomExtents(AcDbExtents& extents) const override;
+
+private:
+    std::wstring m_tag;
 };
 
 // Таблицы символов. Имена сравниваются без учёта регистра, как в AutoCAD.
@@ -737,9 +802,66 @@ public:
     Acad::ErrorStatus getName(AcString& name) const { name = m_name.c_str(); return Acad::eOk; }
     Acad::ErrorStatus setName(const ACHAR* pName);
     const std::wstring& mockName() const { return m_name; }
+    // Только для имитации: имя без проверки (например, "*Model_Space" или "*U1").
+    void mockSetName(const ACHAR* pName) { m_name = pName; }
 
 private:
     std::wstring m_name;
+};
+
+class AcDbBlockTableRecordIterator;
+
+class AcDbBlockTableRecord : public AcDbSymbolTableRecord
+{
+public:
+    ~AcDbBlockTableRecord() override;
+    Acad::ErrorStatus appendAcDbEntity(AcDbObjectId& id, AcDbEntity* pEntity);
+    Acad::ErrorStatus newIterator(AcDbBlockTableRecordIterator*& pIterator,
+                                  bool atBeginning = true, bool skipDeleted = true) const;
+    AcGePoint3d origin() const { return mockOrigin; }
+    bool isLayout() const { return mockIsLayout; }
+    bool isAnonymous() const { return mockIsAnonymous; }
+    bool isFromExternalReference() const { return mockIsXref; }
+
+    // Объекты, добавленные в запись; принадлежат записи и удаляются вместе с ней.
+    std::vector<AcDbEntity*> entities;
+    // Свойства определения блока, которые задаёт тест.
+    AcGePoint3d mockOrigin;
+    bool mockIsLayout = false;
+    bool mockIsAnonymous = false;
+    bool mockIsXref = false;
+    // Признак динамического блока для AcDbDynBlockReference::isDynamicBlock().
+    bool mockIsDynamic = false;
+};
+
+// Обход примитивов определения блока. getEntity() «открывает» примитив
+// (AcDbObject::openCount), вызывающий обязан его закрыть.
+class AcDbBlockTableRecordIterator
+{
+public:
+    explicit AcDbBlockTableRecordIterator(const std::vector<AcDbEntity*>& entities)
+        : m_entities(entities), m_index(0) {}
+
+    void start(bool atBeginning = true, bool /*skipDeleted*/ = true)
+    {
+        m_index = atBeginning ? 0 : m_entities.size();
+    }
+    bool done() const { return m_index >= m_entities.size(); }
+    void step(bool /*forward*/ = true, bool /*skipDeleted*/ = true) { ++m_index; }
+    Acad::ErrorStatus getEntityId(AcDbObjectId& entityId) const;
+    Acad::ErrorStatus getEntity(AcDbEntity*& pEntity, AcDb::OpenMode openMode = AcDb::kForRead,
+                                bool openErasedEntity = false) const;
+
+private:
+    std::vector<AcDbEntity*> m_entities;
+    size_t m_index;
+};
+
+// Определение динамического блока (dbdynblk.h).
+class AcDbDynBlockReference
+{
+public:
+    static bool isDynamicBlock(AcDbObjectId blockTableRecordId);
 };
 
 class AcDbLayerTableRecord : public AcDbSymbolTableRecord
@@ -812,6 +934,7 @@ public:
         if (done())
             return Acad::eInvalidInput;
         pRecord = static_cast<RecordType*>(m_records[m_index]);
+        pRecord->mockOpened();
         return Acad::eOk;
     }
 
@@ -862,14 +985,23 @@ namespace AcDbSymbolUtilities
 }
 const AcDbSymbolUtilities::Services* acdbSymUtil();
 
-class AcDbBlockTable : public AcDbObject
+typedef MockSymbolTableIterator<AcDbBlockTableRecord> AcDbBlockTableIterator;
+
+// Таблица блоков: пространство модели (принадлежит базе) и определения блоков
+// из records. getAt() с указателем «открывает» запись — её нужно закрыть.
+class AcDbBlockTable : public AcDbSymbolTable
 {
 public:
-    AcRxClass* isA() const override { return nullptr; }
+    using AcDbSymbolTable::AcDbSymbolTable;
+    using AcDbSymbolTable::getAt;
+    Acad::ErrorStatus add(AcDbBlockTableRecord* pRecord) { return addRecord(pRecord); }
     Acad::ErrorStatus getAt(const ACHAR* entryName, AcDbBlockTableRecord*& pRec,
                             AcDb::OpenMode openMode, bool openErasedRec = false) const;
+    Acad::ErrorStatus newIterator(AcDbBlockTableIterator*& pIterator, bool atBeginning = true,
+                                  bool skipDeleted = true) const;
     AcDbBlockTableRecord* modelSpace = nullptr;
     mutable AcDb::OpenMode lastOpenMode = AcDb::kForRead;
+    mutable int getAtCalls = 0;
 };
 
 class AcDbDatabase
@@ -884,6 +1016,8 @@ public:
     // Только для имитации: создаёт запись таблицы с заданным именем.
     AcDbObjectId mockAddLayer(const ACHAR* name);
     AcDbObjectId mockAddTextStyle(const ACHAR* name, bool isShapeFile = false);
+    // Создаёт пустое определение блока (имя не проверяется); nullptr, если имя занято.
+    AcDbBlockTableRecord* mockAddBlock(const ACHAR* name);
 
     AcDbBlockTable blockTable;
     AcDbBlockTableRecord modelSpace;
@@ -952,6 +1086,30 @@ namespace mock
     extern int mdiAwareCalls;
     extern int unlockCalls;
     extern int buildHierarchyCalls;
+
+    // Группа DXF, которую вернёт acdbEntGet() (см. setEntGet).
+    struct DxfGroup
+    {
+        enum class Type { String, Name, Int16 };
+        short code;
+        Type type;
+        std::wstring str;
+        AcDbObjectId id;
+        short i;
+
+        static DxfGroup text(short code, const wchar_t* value);
+        static DxfGroup name(short code, AcDbObjectId value);
+        static DxfGroup int16(short code, short value);
+    };
+
+    // Задаёт ответ acdbEntGet() для объекта id (словаря, графа, узла параметра).
+    // Перед группами автоматически добавляется (-1 . id), как в AutoCAD.
+    void setEntGet(AcDbObjectId id, const std::vector<DxfGroup>& groups);
+    // Новый уникальный идентификатор для неграфических объектов имитации.
+    AcDbObjectId newId();
+    // Число вызовов acdbEntGet() и ещё не освобождённых через acutRelRb() узлов resbuf.
+    extern int entGetCalls;
+    extern int liveResbufs;
 
     // Пересоздаёт рабочую базу данных и сбрасывает состояние имитации.
     void reset();

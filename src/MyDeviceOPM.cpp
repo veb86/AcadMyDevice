@@ -1,9 +1,15 @@
 // MyDeviceOPM.cpp — динамические свойства MyDevice для палитры свойств AutoCAD.
 //
-// Каждое из 12 свойств — отдельный COM-объект, реализующий IDynamicProperty
+// Каждое из 14 свойств — отдельный COM-объект, реализующий IDynamicProperty
 // (имя, тип, чтение и запись значения) и ICategorizeProperties (категория
-// «Text 1»/«Text 2»). Свойство Font дополнительно реализует IDynamicEnumProperty:
-// палитра показывает раскрывающийся список текстовых стилей чертежа.
+// «MyDevice», «Text 1» или «Text 2»). Свойства блока регистрируются первыми,
+// поэтому категория «MyDevice» стоит над текстами.
+//
+// Раскрывающиеся списки (IDynamicEnumProperty):
+//  * BlockName — блоки чертежа (без листов, анонимных блоков и внешних ссылок);
+//  * Visibility — состояния видимости блока; свойство недоступно, если у блока
+//    нет параметра видимости;
+//  * Font — текстовые стили чертежа.
 // Layer — строка: можно ввести имя любого слоя, отсутствующий слой создаётся.
 //
 // После записи значения объект закрывается, AutoCAD перерисовывает его,
@@ -25,7 +31,11 @@
 namespace
 {
     // Категории палитры: положительные номера принадлежат приложению.
+    const PROPCAT kBlockCategory = 1000;  // «MyDevice»
     const PROPCAT kFirstCategory = 1001;  // «Text 1»; «Text 2» — kFirstCategory + 1
+
+    // Номера GUID свойств блока: после свойств текстов (0..11), с запасом.
+    const int kFirstBlockGuid = 0x10;
 
     // GUID свойства index: базовый GUID, последний байт которого равен номеру свойства.
     GUID propertyGuid(int index)
@@ -52,14 +62,23 @@ namespace
         return id;
     }
 
+    // Свойство текста (Text 1/Text 2) или свойство блока (категория MyDevice).
     class MyDeviceDynamicProperty : public IDynamicProperty,
                                     public IDynamicEnumProperty,
                                     public ICategorizeProperties
     {
     public:
+        // Свойство текста: index — номер в MyDeviceProperties::at().
         explicit MyDeviceDynamicProperty(int index)
-            : m_refCount(1), m_index(index), m_descriptor(MyDeviceProperties::at(index)),
-              m_pNotify(nullptr)
+            : m_refCount(1), m_guidIndex(index), m_pText(&MyDeviceProperties::at(index)),
+              m_pBlock(nullptr), m_pNotify(nullptr)
+        {
+        }
+
+        // Свойство блока: field — MyDeviceProperties::kBlockName или kVisibility.
+        explicit MyDeviceDynamicProperty(MyDeviceProperties::BlockField field)
+            : m_refCount(1), m_guidIndex(kFirstBlockGuid + field), m_pText(nullptr),
+              m_pBlock(&MyDeviceProperties::blockAt(field)), m_pNotify(nullptr)
         {
         }
 
@@ -79,7 +98,7 @@ namespace
                 *ppvObject = static_cast<IDynamicProperty*>(this);
             else if (riid == __uuidof(ICategorizeProperties))
                 *ppvObject = static_cast<ICategorizeProperties*>(this);
-            else if (riid == __uuidof(IDynamicEnumProperty) && isFont())
+            else if (riid == __uuidof(IDynamicEnumProperty) && isEnum())
                 *ppvObject = static_cast<IDynamicEnumProperty*>(this);
             else
                 return E_NOINTERFACE;
@@ -105,20 +124,28 @@ namespace
         {
             if (propGUID == nullptr)
                 return E_POINTER;
-            *propGUID = propertyGuid(m_index);
+            *propGUID = propertyGuid(m_guidIndex);
             return S_OK;
         }
 
         STDMETHODIMP GetDisplayName(BSTR* bstrName) override
         {
-            return allocString(m_descriptor.name, bstrName);
+            return allocString(name(), bstrName);
         }
 
-        STDMETHODIMP IsPropertyEnabled(LONG_PTR /*objectID*/, BOOL* pbEnabled) override
+        STDMETHODIMP IsPropertyEnabled(LONG_PTR objectID, BOOL* pbEnabled) override
         {
             if (pbEnabled == nullptr)
                 return E_POINTER;
             *pbEnabled = TRUE;
+            if (isBlockField(MyDeviceProperties::kVisibility))
+            {
+                // Visibility есть только у Dynamic Block с параметром видимости.
+                m_lastObjectId = objectIdOf(objectID);
+                AcDbObjectPointer<MyDevice> pDevice(m_lastObjectId, AcDb::kForRead);
+                *pbEnabled = pDevice.openStatus() == Acad::eOk
+                    && MyDeviceProperties::hasVisibility(*pDevice) ? TRUE : FALSE;
+            }
             return S_OK;
         }
 
@@ -132,7 +159,8 @@ namespace
 
         STDMETHODIMP GetDescription(BSTR* bstrName) override
         {
-            return allocString(m_descriptor.description, bstrName);
+            return allocString(m_pText != nullptr ? m_pText->description : m_pBlock->description,
+                               bstrName);
         }
 
         STDMETHODIMP GetCurrentValueName(BSTR* /*pbstrName*/) override
@@ -144,7 +172,7 @@ namespace
         {
             if (pVarType == nullptr)
                 return E_POINTER;
-            *pVarType = MyDeviceProperties::isNumeric(m_descriptor.field) ? VT_R8 : VT_BSTR;
+            *pVarType = isNumeric() ? VT_R8 : VT_BSTR;
             return S_OK;
         }
 
@@ -152,20 +180,27 @@ namespace
         {
             if (pvarData == nullptr)
                 return E_POINTER;
-            AcDbObjectPointer<MyDevice> pDevice(objectIdOf(objectID), AcDb::kForRead);
+            // Список состояний Visibility строится для последнего запрошенного объекта.
+            m_lastObjectId = objectIdOf(objectID);
+            AcDbObjectPointer<MyDevice> pDevice(m_lastObjectId, AcDb::kForRead);
             if (pDevice.openStatus() != Acad::eOk)
                 return E_FAIL;
 
             ::VariantInit(pvarData);
-            if (MyDeviceProperties::isNumeric(m_descriptor.field))
+            if (isNumeric())
             {
                 V_VT(pvarData) = VT_R8;
-                V_R8(pvarData) = MyDeviceProperties::getDouble(*pDevice, m_descriptor.textIndex,
-                                                                m_descriptor.field);
+                V_R8(pvarData) = MyDeviceProperties::getDouble(*pDevice, m_pText->textIndex,
+                                                                m_pText->field);
                 return S_OK;
             }
-            const AcString value = MyDeviceProperties::getString(*pDevice, m_descriptor.textIndex,
-                                                                 m_descriptor.field);
+            AcString value;
+            if (isBlockField(MyDeviceProperties::kBlockName))
+                value = MyDeviceProperties::blockName(*pDevice);
+            else if (isBlockField(MyDeviceProperties::kVisibility))
+                value = MyDeviceProperties::visibility(*pDevice);
+            else
+                value = MyDeviceProperties::getString(*pDevice, m_pText->textIndex, m_pText->field);
             V_VT(pvarData) = VT_BSTR;
             return allocString(value.kACharPtr(), &V_BSTR(pvarData));
         }
@@ -207,34 +242,49 @@ namespace
             return S_OK;
         }
 
-        // *** IDynamicEnumProperty (только Font) ***
+        // *** IDynamicEnumProperty (BlockName, Visibility, Font) ***
         STDMETHODIMP GetNumPropertyValues(LONG* numValues) override
         {
             if (numValues == nullptr)
                 return E_POINTER;
-            // Список перечитывается при каждом открытии: стили могли добавить или удалить.
-            MyDeviceProperties::textStyleNames(
-                acdbHostApplicationServices()->workingDatabase(), m_styleNames);
-            *numValues = static_cast<LONG>(m_styleNames.size());
+            // Список перечитывается при каждом открытии: блоки, состояния и стили
+            // могли добавить или удалить.
+            AcDbDatabase* pDb = acdbHostApplicationServices()->workingDatabase();
+            if (isBlockField(MyDeviceProperties::kBlockName))
+            {
+                MyDeviceProperties::blockNames(pDb, m_values);
+            }
+            else if (isBlockField(MyDeviceProperties::kVisibility))
+            {
+                m_values.clear();
+                AcDbObjectPointer<MyDevice> pDevice(m_lastObjectId, AcDb::kForRead);
+                if (pDevice.openStatus() == Acad::eOk)
+                    MyDeviceProperties::visibilityStates(*pDevice, m_values);
+            }
+            else
+            {
+                MyDeviceProperties::textStyleNames(pDb, m_values);
+            }
+            *numValues = static_cast<LONG>(m_values.size());
             return S_OK;
         }
 
         STDMETHODIMP GetPropValueName(LONG index, BSTR* valueName) override
         {
-            if (index < 0 || static_cast<size_t>(index) >= m_styleNames.size())
+            if (index < 0 || static_cast<size_t>(index) >= m_values.size())
                 return E_INVALIDARG;
-            return allocString(m_styleNames[index].kACharPtr(), valueName);
+            return allocString(m_values[index].kACharPtr(), valueName);
         }
 
         STDMETHODIMP GetPropValueData(LONG index, VARIANT* valueData) override
         {
             if (valueData == nullptr)
                 return E_POINTER;
-            if (index < 0 || static_cast<size_t>(index) >= m_styleNames.size())
+            if (index < 0 || static_cast<size_t>(index) >= m_values.size())
                 return E_INVALIDARG;
             ::VariantInit(valueData);
             V_VT(valueData) = VT_BSTR;
-            return allocString(m_styleNames[index].kACharPtr(), &V_BSTR(valueData));
+            return allocString(m_values[index].kACharPtr(), &V_BSTR(valueData));
         }
 
         // *** ICategorizeProperties ***
@@ -242,12 +292,15 @@ namespace
         {
             if (ppropcat == nullptr)
                 return E_POINTER;
-            *ppropcat = kFirstCategory + m_descriptor.textIndex;
+            *ppropcat = m_pText != nullptr ? kFirstCategory + m_pText->textIndex : kBlockCategory;
             return S_OK;
         }
 
         STDMETHODIMP GetCategoryName(PROPCAT propcat, LCID /*lcid*/, BSTR* pbstrName) override
         {
+            if (propcat == kBlockCategory)
+                return allocString(MyDeviceProperties::blockAt(MyDeviceProperties::kBlockName)
+                                       .category, pbstrName);
             const int textIndex = propcat - kFirstCategory;
             if (textIndex < 0 || textIndex >= MyDevice::kTextCount)
                 return E_INVALIDARG;
@@ -256,11 +309,36 @@ namespace
         }
 
     private:
-        bool isFont() const { return m_descriptor.field == MyDeviceProperties::kFont; }
+        const ACHAR* name() const { return m_pText != nullptr ? m_pText->name : m_pBlock->name; }
+        const ACHAR* category() const
+        {
+            return m_pText != nullptr ? m_pText->category : m_pBlock->category;
+        }
+        bool isBlockField(MyDeviceProperties::BlockField field) const
+        {
+            return m_pBlock != nullptr && m_pBlock->field == field;
+        }
+        bool isNumeric() const
+        {
+            return m_pText != nullptr && MyDeviceProperties::isNumeric(m_pText->field);
+        }
+        bool isEnum() const
+        {
+            return m_pBlock != nullptr || m_pText->field == MyDeviceProperties::kFont;
+        }
+
+        Acad::ErrorStatus setString(MyDevice& device, const AcString& value) const
+        {
+            if (isBlockField(MyDeviceProperties::kBlockName))
+                return MyDeviceProperties::setBlockName(device, value);
+            if (isBlockField(MyDeviceProperties::kVisibility))
+                return MyDeviceProperties::setVisibility(device, value);
+            return MyDeviceProperties::setString(device, m_pText->textIndex, m_pText->field, value);
+        }
 
         HRESULT setValue(const AcDbObjectId& id, const VARIANT& varData)
         {
-            const bool numeric = MyDeviceProperties::isNumeric(m_descriptor.field);
+            const bool numeric = isNumeric();
             VARIANT value;
             ::VariantInit(&value);
             if (FAILED(::VariantChangeType(&value, const_cast<VARIANT*>(&varData), 0,
@@ -272,12 +350,10 @@ namespace
             if (pDevice.openStatus() == Acad::eOk)
             {
                 const Acad::ErrorStatus es = numeric
-                    ? MyDeviceProperties::setDouble(*pDevice, m_descriptor.textIndex,
-                                                    m_descriptor.field, V_R8(&value))
-                    : MyDeviceProperties::setString(*pDevice, m_descriptor.textIndex,
-                                                    m_descriptor.field,
-                                                    AcString(V_BSTR(&value) != nullptr
-                                                             ? V_BSTR(&value) : L""));
+                    ? MyDeviceProperties::setDouble(*pDevice, m_pText->textIndex,
+                                                    m_pText->field, V_R8(&value))
+                    : setString(*pDevice, AcString(V_BSTR(&value) != nullptr
+                                                   ? V_BSTR(&value) : L""));
                 if (es == Acad::eOk)
                 {
                     hr = S_OK;
@@ -285,7 +361,7 @@ namespace
                 else
                 {
                     acutPrintf(_T("\nMyDevice: недопустимое значение свойства %s (%s)."),
-                               m_descriptor.name, m_descriptor.category);
+                               name(), category());
                     hr = E_INVALIDARG;
                 }
             }
@@ -294,10 +370,12 @@ namespace
         }
 
         LONG m_refCount;
-        const int m_index;
-        const MyDeviceProperties::Descriptor& m_descriptor;
+        const int m_guidIndex;
+        const MyDeviceProperties::Descriptor* m_pText;        // свойство текста или nullptr
+        const MyDeviceProperties::BlockDescriptor* m_pBlock;  // свойство блока или nullptr
         IDynamicPropertyNotify* m_pNotify;
-        std::vector<AcString> m_styleNames;
+        AcDbObjectId m_lastObjectId;       // объект, для которого строится список Visibility
+        std::vector<AcString> m_values;    // значения раскрывающегося списка
     };
 
     // Свойства, добавленные в палитру; по одной ссылке на каждое хранит приложение.
@@ -322,9 +400,14 @@ bool registerMyDeviceProperties()
     IPropertyManager* pManager = propertyManager();
     if (pManager == nullptr)
         return false;
+    // Порядок добавления задаёт порядок в палитре: сначала MyDevice, затем тексты.
+    std::vector<MyDeviceDynamicProperty*> properties;
+    for (int i = 0; i < MyDeviceProperties::blockCount(); ++i)
+        properties.push_back(new MyDeviceDynamicProperty(MyDeviceProperties::blockAt(i).field));
     for (int i = 0; i < MyDeviceProperties::count(); ++i)
+        properties.push_back(new MyDeviceDynamicProperty(i));
+    for (MyDeviceDynamicProperty* pProperty : properties)
     {
-        MyDeviceDynamicProperty* pProperty = new MyDeviceDynamicProperty(i);
         if (SUCCEEDED(pManager->AddProperty(pProperty)))
             g_properties.push_back(pProperty);
         else

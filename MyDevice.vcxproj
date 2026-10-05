@@ -98,12 +98,14 @@
   <ItemGroup>
     <ClCompile Include="src\acrxEntryPoint.cpp" />
     <ClCompile Include="src\MyDevice.cpp" />
+    <ClCompile Include="src\MyDeviceBlock.cpp" />
     <ClCompile Include="src\MyDeviceCommand.cpp" />
     <ClCompile Include="src\MyDeviceOPM.cpp" />
     <ClCompile Include="src\MyDeviceProperties.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\MyDevice.h" />
+    <ClInclude Include="src\MyDeviceBlock.h" />
     <ClInclude Include="src\MyDeviceCommand.h" />
     <ClInclude Include="src\MyDeviceOPM.h" />
     <ClInclude Include="src\MyDeviceProperties.h" />

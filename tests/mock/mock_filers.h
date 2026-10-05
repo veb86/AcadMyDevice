@@ -309,6 +309,11 @@ private:
 // Записывает все графические примитивы, которые объект выдаёт в subWorldDraw(),
 // вместе со слоем, установленным через subEntityTraits() на момент вызова.
 // Пустой идентификатор слоя означает «слой самого объекта» (setLayer не вызывался).
+//
+// Матрицы pushModelTransform() накапливаются в стеке; каждый примитив запоминает
+// матрицу, действующую в момент вызова (transform), а worldPoints() пересчитывает
+// точки полилинии в МСК. draw() записывает вложенный объект и, как AutoCAD,
+// рисует его через worldDraw() с тем же стеком матриц.
 class RecordingWorldDraw : public AcGiWorldDraw, public AcGiWorldGeometry,
                            public AcGiSubEntityTraits
 {
@@ -318,6 +323,22 @@ public:
         std::vector<AcGePoint3d> points;
         bool hasNormal;
         AcGeVector3d normal;
+        AcDbObjectId layerId;
+        AcGeMatrix3d transform;
+
+        std::vector<AcGePoint3d> worldPoints() const
+        {
+            std::vector<AcGePoint3d> result = points;
+            for (AcGePoint3d& p : result)
+                p.transformBy(transform);
+            return result;
+        }
+    };
+
+    struct Drawn
+    {
+        const AcGiDrawable* drawable;
+        AcGeMatrix3d transform;
         AcDbObjectId layerId;
     };
 
@@ -337,6 +358,7 @@ public:
         bool styleLoaded = false;
         Adesk::Int32 length = 0;
         bool raw = false;
+        AcGeMatrix3d transform;
     };
 
     mutable std::vector<Polyline> polylines;
@@ -344,6 +366,57 @@ public:
     bool abort = false;
     AcDbObjectId currentLayer;
     int setLayerCalls = 0;
+    mutable std::vector<Drawn> drawn;
+    // Текущий стек матриц модели (пустой — единичная матрица).
+    std::vector<AcGeMatrix3d> transforms;
+    int pushCalls = 0;
+    int popCalls = 0;
+    // Предел вложенности draw(): защищает тест от бесконечной рекурсии.
+    static const int kMaxDepth = 16;
+    mutable int depth = 0;
+    mutable bool depthExceeded = false;
+
+    AcGeMatrix3d currentTransform() const
+    {
+        return transforms.empty() ? AcGeMatrix3d() : transforms.back();
+    }
+
+    Adesk::Boolean pushModelTransform(const AcGeMatrix3d& xMat) override
+    {
+        pushCalls++;
+        transforms.push_back(currentTransform() * xMat);
+        return Adesk::kFalse;
+    }
+    Adesk::Boolean popModelTransform() override
+    {
+        popCalls++;
+        if (!transforms.empty())
+            transforms.pop_back();
+        return Adesk::kFalse;
+    }
+    Adesk::Boolean draw(AcGiDrawable* pDrawable) const override
+    {
+        Drawn d;
+        d.drawable = pDrawable;
+        d.transform = currentTransform();
+        d.layerId = currentLayer;
+        drawn.push_back(d);
+        AcDbEntity* pEntity = dynamic_cast<AcDbEntity*>(pDrawable);
+        if (pEntity == nullptr)
+            return Adesk::kFalse;
+        if (depth >= kMaxDepth)
+        {
+            depthExceeded = true;
+            return Adesk::kFalse;
+        }
+        RecordingWorldDraw& self = const_cast<RecordingWorldDraw&>(*this);
+        const AcDbObjectId savedLayer = currentLayer;
+        depth++;
+        pEntity->worldDraw(&self);
+        depth--;
+        self.currentLayer = savedLayer;
+        return Adesk::kFalse;
+    }
 
     AcGiWorldGeometry& geometry() const override
     {
@@ -371,6 +444,7 @@ public:
         if (pNormal)
             pl.normal = *pNormal;
         pl.layerId = currentLayer;
+        pl.transform = currentTransform();
         polylines.push_back(pl);
         return Adesk::kFalse;
     }
@@ -389,6 +463,7 @@ public:
         t.oblique = oblique;
         t.message = pMsg ? pMsg : L"";
         t.layerId = currentLayer;
+        t.transform = currentTransform();
         texts.push_back(t);
         return Adesk::kFalse;
     }

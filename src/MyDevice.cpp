@@ -17,6 +17,7 @@ const double MyDevice::kWidth = 100.0;
 const double MyDevice::kHeight = 50.0;
 const double MyDevice::kTextHeight = 10.0;
 const double MyDevice::kTextMargin = 5.0;
+const double MyDevice::kNotFoundTextHeight = 5.0;
 const ACHAR* const MyDevice::kDefaultTextStyle = _T("Standard");
 
 namespace
@@ -45,6 +46,13 @@ namespace
     const int kDxfTextPositionBase = AcDb::kDxfXCoord + 2;        // 12, 13
     const int kDxfTextLayerBase = AcDb::kDxfXTextString + 2;      // 302, 303
     const int kDxfTextStyleBase = AcDb::kDxfXTextString + 4;      // 304, 305
+
+    // Блок (версия 3).
+    const AcDb::DxfCode kDxfBlockName = static_cast<AcDb::DxfCode>(AcDb::kDxfXTextString + 6);  // 306
+    const AcDb::DxfCode kDxfVisibility = static_cast<AcDb::DxfCode>(AcDb::kDxfXTextString + 7); // 307
+
+    // Надпись на месте отсутствующего блока.
+    const ACHAR kBlockNotFound[] = _T("BLOCK NOT FOUND");
 
     const ACHAR kDxfSubclassName[] = _T("MyDevice");
 
@@ -250,6 +258,66 @@ MyDeviceText MyDevice::defaultText(int index)
     return text;
 }
 
+AcString MyDevice::blockName() const
+{
+    assertReadEnabled();
+    return m_blockName;
+}
+
+Acad::ErrorStatus MyDevice::setBlockName(const AcString& name)
+{
+    // Новый блок может быть другого типа: тип и состояния видимости определяются заново.
+    MyDeviceBlock::Info info;
+    MyDeviceBlock::find(databaseOrWorking(), name, info);
+
+    // Новый блок начинается с состояния по умолчанию; тот же блок сохраняет своё состояние.
+    AcString visibility = info.hasVisibility ? info.states.front().name : AcString();
+    if (name == blockName() && info.findState(m_visibility) >= 0)
+        visibility = m_visibility;
+
+    assertWriteEnabled();
+    m_blockName = name;
+    m_visibility = visibility;
+    return Acad::eOk;
+}
+
+AcString MyDevice::visibility() const
+{
+    assertReadEnabled();
+    return m_visibility;
+}
+
+Acad::ErrorStatus MyDevice::setVisibility(const AcString& state)
+{
+    MyDeviceBlock::Info info;
+    findBlock(info);
+    if (!info.hasVisibility)
+        return Acad::eNotApplicable;
+    if (info.findState(state) < 0)
+        return Acad::eInvalidInput;
+
+    assertWriteEnabled();
+    m_visibility = state;
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus MyDevice::findBlock(MyDeviceBlock::Info& info) const
+{
+    assertReadEnabled();
+    return MyDeviceBlock::find(databaseOrWorking(), m_blockName, info);
+}
+
+AcDbDatabase* MyDevice::databaseOrWorking() const
+{
+    AcDbDatabase* pDb = database();
+    return pDb != nullptr ? pDb : acdbHostApplicationServices()->workingDatabase();
+}
+
+AcGeMatrix3d MyDevice::blockToWorld(const MyDeviceBlock::Info& info) const
+{
+    return localToWorld() * AcGeMatrix3d::translation(AcGePoint3d::kOrigin - info.origin);
+}
+
 AcGeMatrix3d MyDevice::localToWorld() const
 {
     assertReadEnabled();
@@ -302,6 +370,9 @@ Acad::ErrorStatus MyDevice::dwgOutFields(AcDbDwgFiler* pFiler) const
         pFiler->writeString(m_texts[i].layer);
         pFiler->writeString(m_texts[i].textStyle);
     }
+    // Версия 3: блок и его состояние видимости.
+    pFiler->writeString(m_blockName);
+    pFiler->writeString(m_visibility);
 
     return pFiler->filerStatus();
 }
@@ -341,11 +412,22 @@ Acad::ErrorStatus MyDevice::dwgInFields(AcDbDwgFiler* pFiler)
             pFiler->readString(texts[i].textStyle);
         }
     }
+    // До версии 3 блока не было. Тип блока и состояния здесь не проверяются:
+    // при чтении DWG определение блока может быть ещё не загружено, поэтому
+    // они определяются заново при отрисовке и в палитре свойств.
+    AcString blockName, visibility;
+    if (version >= 3)
+    {
+        pFiler->readString(blockName);
+        pFiler->readString(visibility);
+    }
     if ((es = pFiler->filerStatus()) != Acad::eOk)
         return es;
 
     for (int i = 0; i < kTextCount; ++i)
         m_texts[i] = texts[i];
+    m_blockName = blockName;
+    m_visibility = visibility;
     return Acad::eOk;
 }
 
@@ -378,6 +460,8 @@ Acad::ErrorStatus MyDevice::dxfOutFields(AcDbDxfFiler* pFiler) const
         pFiler->writeString(dxfCode(kDxfTextLayerBase, i), text.layer);
         pFiler->writeString(dxfCode(kDxfTextStyleBase, i), text.textStyle);
     }
+    pFiler->writeString(kDxfBlockName, m_blockName);
+    pFiler->writeString(kDxfVisibility, m_visibility);
 
     return pFiler->filerStatus();
 }
@@ -399,6 +483,7 @@ Acad::ErrorStatus MyDevice::dxfInFields(AcDbDxfFiler* pFiler)
     AcGeVector3d normal = AcGeVector3d::kZAxis;
     double scale = 1.0;
     MyDeviceText texts[kTextCount] = { defaultText(kText1), defaultText(kText2) };
+    AcString blockName, visibility;
 
     Acad::ErrorStatus es = Acad::eOk;
     resbuf rb;
@@ -444,6 +529,12 @@ Acad::ErrorStatus MyDevice::dxfInFields(AcDbDxfFiler* pFiler)
         case kDxfTextStyleBase + kText2:
             texts[rb.restype - kDxfTextStyleBase].textStyle = rb.resval.rstring;
             break;
+        case kDxfBlockName:
+            blockName = rb.resval.rstring;
+            break;
+        case kDxfVisibility:
+            visibility = rb.resval.rstring;
+            break;
         default:
             // Чужая группа — возвращаем её, чтобы её прочитал следующий подкласс.
             pFiler->pushBackItem();
@@ -488,6 +579,8 @@ Acad::ErrorStatus MyDevice::dxfInFields(AcDbDxfFiler* pFiler)
     m_scale = scale;
     for (int i = 0; i < kTextCount; ++i)
         m_texts[i] = texts[i];
+    m_blockName = blockName;
+    m_visibility = visibility;
 
     return pFiler->filerStatus();
 }
@@ -509,15 +602,48 @@ Adesk::Boolean MyDevice::subWorldDraw(AcGiWorldDraw* pWd)
     outline[4] = outline[0];
     pWd->geometry().polyline(5, outline, &m_normal);
 
+    // Блок рисуется поверх прямоугольника, тексты — поверх блока.
+    AcDbDatabase* pDb = databaseOrWorking();
+    drawBlock(pWd, pDb);
+
     // Тексты рисуются примитивами AcGi, без создания AcDbText/AcDbMText.
     // Прямоугольник уже нарисован на слое объекта, поэтому слой меняется только здесь.
-    AcDbDatabase* pDb = database();
-    if (pDb == nullptr)
-        pDb = acdbHostApplicationServices()->workingDatabase();
     for (int i = 0; i < kTextCount; ++i)
         drawText(pWd, pDb, m_texts[i]);
 
     return Adesk::kTrue;
+}
+
+void MyDevice::drawBlock(AcGiWorldDraw* pWd, AcDbDatabase* pDb) const
+{
+    MyDeviceBlock::Info info;
+    MyDeviceBlock::find(pDb, m_blockName, info);
+    if (info.kind == MyDeviceBlock::kNoBlock)
+        return;
+    if (info.kind == MyDeviceBlock::kNotFound)
+    {
+        // Надпись стоит на месте базовой точки блока, стилем Standard и на слое объекта.
+        MyDeviceText message;
+        message.text = kBlockNotFound;
+        message.height = kNotFoundTextHeight;
+        message.x = 0.0;
+        message.y = 0.0;
+        message.textStyle = kDefaultTextStyle;
+        drawText(pWd, pDb, message);
+        return;
+    }
+
+    // Примитивы определения блока рисуются как есть (без создания вставки блока)
+    // в системе координат объекта. Определение блока не меняется.
+    const AcDbObjectId deviceLayerId = layerId();
+    if (!deviceLayerId.isNull())
+        pWd->subEntityTraits().setLayer(deviceLayerId);
+    const int stateIndex = info.effectiveState(m_visibility);
+    pWd->geometry().pushModelTransform(blockToWorld(info));
+    MyDeviceBlock::forEachVisibleEntity(pDb, info, stateIndex, [pWd](AcDbEntity* pEntity) {
+        pWd->geometry().draw(pEntity);
+    });
+    pWd->geometry().popModelTransform();
 }
 
 void MyDevice::drawText(AcGiWorldDraw* pWd, AcDbDatabase* pDb, const MyDeviceText& text) const
@@ -555,6 +681,33 @@ void MyDevice::subList() const
     acutPrintf(_T("%18s%16s X = %-9.16q0, Y = %-9.16q0, Z = %-9.16q0\n"),
                _T(""), _T("Insertion point:"),
                m_position.x, m_position.y, m_position.z);
+
+    MyDeviceBlock::Info info;
+    findBlock(info);
+    const ACHAR* kind = _T("");
+    switch (info.kind)
+    {
+    case MyDeviceBlock::kNotFound:
+        kind = _T(" (BLOCK NOT FOUND)");
+        break;
+    case MyDeviceBlock::kOrdinary:
+        kind = _T(" (block)");
+        break;
+    case MyDeviceBlock::kDynamic:
+        kind = _T(" (dynamic block)");
+        break;
+    default:
+        break;
+    }
+    acutPrintf(_T("%18s%16s %s%s\n"), _T(""), _T("Block name:"),
+               m_blockName.isEmpty() ? _T("(none)") : m_blockName.kACharPtr(), kind);
+    if (info.hasVisibility)
+    {
+        const int stateIndex = info.effectiveState(m_visibility);
+        acutPrintf(_T("%18s%16s %s\n"), _T(""), _T("Visibility:"),
+                   info.states[static_cast<size_t>(stateIndex)].name.kACharPtr());
+    }
+
     for (int i = 0; i < kTextCount; ++i)
     {
         const MyDeviceText& text = m_texts[i];
@@ -611,6 +764,27 @@ Acad::ErrorStatus MyDevice::subGetGeomExtents(AcDbExtents& extents) const
         extents.addPoint(base.transformBy(xform));
         extents.addPoint(top.transformBy(xform));
     }
+
+    // Видимые примитивы блока: углы их габаритов в системе координат блока.
+    MyDeviceBlock::Info info;
+    findBlock(info);
+    const AcGeMatrix3d blockXform = blockToWorld(info);
+    MyDeviceBlock::forEachVisibleEntity(
+        databaseOrWorking(), info, info.effectiveState(m_visibility),
+        [&extents, &blockXform](AcDbEntity* pEntity) {
+            AcDbExtents entityExtents;
+            if (pEntity->getGeomExtents(entityExtents) != Acad::eOk)
+                return;
+            const AcGePoint3d lo = entityExtents.minPoint();
+            const AcGePoint3d hi = entityExtents.maxPoint();
+            for (int corner = 0; corner < 8; ++corner)
+            {
+                AcGePoint3d p((corner & 1) ? hi.x : lo.x,
+                              (corner & 2) ? hi.y : lo.y,
+                              (corner & 4) ? hi.z : lo.z);
+                extents.addPoint(p.transformBy(blockXform));
+            }
+        });
     return Acad::eOk;
 }
 

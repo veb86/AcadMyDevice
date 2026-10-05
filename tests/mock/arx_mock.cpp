@@ -24,6 +24,8 @@ namespace mock
     int mdiAwareCalls = 0;
     int unlockCalls = 0;
     int buildHierarchyCalls = 0;
+    int entGetCalls = 0;
+    int liveResbufs = 0;
 }
 
 namespace
@@ -49,20 +51,29 @@ namespace
                 return false;
         return true;
     }
+    // Ответы acdbEntGet() по идентификатору объекта.
+    std::map<intptr_t, std::vector<mock::DxfGroup>> g_entGet;
+
     AcEdCommandStack g_commandStack;
     AcDbHostApplicationServices g_hostServices;
 
+    // Реестр не уничтожается при выходе (как и классы AcRx): иначе базовые классы,
+    // на которые никто не ссылается (AcDbAttributeDefinition), LeakSanitizer
+    // считает утечкой.
     std::map<std::wstring, AcRxClass*>& classRegistry()
     {
-        static std::map<std::wstring, AcRxClass*> registry;
+        static std::map<std::wstring, AcRxClass*>& registry = *new std::map<std::wstring, AcRxClass*>();
         if (registry.empty())
         {
             AcRxClass* rxObject = new AcRxClass(L"AcRxObject", nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
             AcRxClass* dbObject = new AcRxClass(L"AcDbObject", rxObject, 0, 0, 0, nullptr, nullptr, nullptr);
             AcRxClass* dbEntity = new AcRxClass(L"AcDbEntity", dbObject, 0, 0, 0, nullptr, nullptr, nullptr);
+            AcRxClass* attDef = new AcRxClass(L"AcDbAttributeDefinition", dbEntity, 0, 0, 0,
+                                              nullptr, nullptr, nullptr);
             registry[rxObject->name()] = rxObject;
             registry[dbObject->name()] = dbObject;
             registry[dbEntity->name()] = dbEntity;
+            registry[attDef->name()] = attDef;
         }
         return registry;
     }
@@ -114,6 +125,40 @@ void mock::reset()
     mdiAwareCalls = 0;
     unlockCalls = 0;
     buildHierarchyCalls = 0;
+    g_entGet.clear();
+    entGetCalls = 0;
+    liveResbufs = 0;
+}
+
+mock::DxfGroup mock::DxfGroup::text(short code, const wchar_t* value)
+{
+    DxfGroup g{code, Type::String, value, AcDbObjectId(), 0};
+    return g;
+}
+
+mock::DxfGroup mock::DxfGroup::name(short code, AcDbObjectId value)
+{
+    DxfGroup g{code, Type::Name, L"", value, 0};
+    return g;
+}
+
+mock::DxfGroup mock::DxfGroup::int16(short code, short value)
+{
+    DxfGroup g{code, Type::Int16, L"", AcDbObjectId(), value};
+    return g;
+}
+
+void mock::setEntGet(AcDbObjectId id, const std::vector<DxfGroup>& groups)
+{
+    std::vector<DxfGroup>& stored = g_entGet[id.value()];
+    stored.clear();
+    stored.push_back(DxfGroup::name(-1, id));
+    stored.insert(stored.end(), groups.begin(), groups.end());
+}
+
+AcDbObjectId mock::newId()
+{
+    return newObjectId();
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +192,75 @@ int acedGetPoint(const ads_point /*pt*/, const ACHAR* prompt, ads_point result)
 Acad::ErrorStatus acedGetCurrentUCS(AcGeMatrix3d& mat)
 {
     mat = mock::currentUcs;
+    return Acad::eOk;
+}
+
+struct resbuf* acdbEntGet(const ads_name ent)
+{
+    mock::entGetCalls++;
+    auto it = g_entGet.find(static_cast<intptr_t>(ent[0]));
+    if (it == g_entGet.end())
+        return nullptr;
+    resbuf* pHead = nullptr;
+    resbuf* pTail = nullptr;
+    for (const mock::DxfGroup& g : it->second)
+    {
+        resbuf* rb = new resbuf();
+        mock::liveResbufs++;
+        rb->rbnext = nullptr;
+        rb->restype = g.code;
+        switch (g.type)
+        {
+        case mock::DxfGroup::Type::String:
+            rb->resval.rstring = new ACHAR[g.str.size() + 1];
+            std::wcscpy(rb->resval.rstring, g.str.c_str());
+            break;
+        case mock::DxfGroup::Type::Name:
+            rb->resval.rlname[0] = g.id.value();
+            rb->resval.rlname[1] = 0;
+            break;
+        case mock::DxfGroup::Type::Int16:
+            rb->resval.rint = g.i;
+            break;
+        }
+        if (pTail)
+            pTail->rbnext = rb;
+        else
+            pHead = rb;
+        pTail = rb;
+    }
+    return pHead;
+}
+
+int acutRelRb(struct resbuf* rb)
+{
+    while (rb)
+    {
+        resbuf* pNext = rb->rbnext;
+        // Как в AutoCAD, строки освобождаются по коду группы.
+        const bool isString = (rb->restype >= 0 && rb->restype <= 9)
+            || (rb->restype >= 300 && rb->restype <= 309) || rb->restype == 100;
+        if (isString)
+            delete[] rb->resval.rstring;
+        delete rb;
+        mock::liveResbufs--;
+        rb = pNext;
+    }
+    return RTNORM;
+}
+
+Acad::ErrorStatus acdbGetAdsName(ads_name& objName, AcDbObjectId objId)
+{
+    if (objId.isNull())
+        return Acad::eNullObjectId;
+    objName[0] = objId.value();
+    objName[1] = 0;
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus acdbGetObjectId(AcDbObjectId& objId, const ads_name objName)
+{
+    objId = AcDbObjectId(static_cast<intptr_t>(objName[0]));
     return Acad::eOk;
 }
 
@@ -267,6 +381,78 @@ AcDbBlockTableRecord::~AcDbBlockTableRecord()
         delete pEntity;
 }
 
+Acad::ErrorStatus AcDbBlockTableRecord::newIterator(AcDbBlockTableRecordIterator*& pIterator,
+                                                    bool atBeginning, bool skipDeleted) const
+{
+    pIterator = new AcDbBlockTableRecordIterator(entities);
+    pIterator->start(atBeginning, skipDeleted);
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus AcDbBlockTableRecordIterator::getEntityId(AcDbObjectId& entityId) const
+{
+    if (done())
+        return Acad::eInvalidInput;
+    entityId = m_entities[m_index]->objectId();
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus AcDbBlockTableRecordIterator::getEntity(AcDbEntity*& pEntity,
+                                                          AcDb::OpenMode /*openMode*/,
+                                                          bool /*openErasedEntity*/) const
+{
+    if (done())
+        return Acad::eInvalidInput;
+    pEntity = m_entities[m_index];
+    pEntity->mockOpened();
+    return Acad::eOk;
+}
+
+bool AcDbDynBlockReference::isDynamicBlock(AcDbObjectId blockTableRecordId)
+{
+    auto it = g_objects.find(blockTableRecordId.value());
+    const AcDbBlockTableRecord* pRecord =
+        it == g_objects.end() ? nullptr : dynamic_cast<AcDbBlockTableRecord*>(it->second);
+    return pRecord != nullptr && pRecord->mockIsDynamic;
+}
+
+// ---------------------------------------------------------------------------
+// Примитивы для определений блоков
+// ---------------------------------------------------------------------------
+
+Adesk::Boolean AcDbLine::subWorldDraw(AcGiWorldDraw* pWd)
+{
+    const AcGePoint3d points[2] = { m_start, m_end };
+    pWd->geometry().polyline(2, points);
+    return Adesk::kTrue;
+}
+
+Acad::ErrorStatus AcDbLine::subGetGeomExtents(AcDbExtents& extents) const
+{
+    extents.addPoint(m_start);
+    extents.addPoint(m_end);
+    return Acad::eOk;
+}
+
+AcRxClass* AcDbAttributeDefinition::desc()
+{
+    return mockFindClass(L"AcDbAttributeDefinition");
+}
+
+Adesk::Boolean AcDbAttributeDefinition::subWorldDraw(AcGiWorldDraw* pWd)
+{
+    pWd->geometry().text(AcGePoint3d::kOrigin, AcGeVector3d::kZAxis, AcGeVector3d::kXAxis,
+                         1.0, 1.0, 0.0, m_tag.c_str());
+    return Adesk::kTrue;
+}
+
+Acad::ErrorStatus AcDbAttributeDefinition::subGetGeomExtents(AcDbExtents& extents) const
+{
+    extents.addPoint(AcGePoint3d(-1000.0, -1000.0, 0.0));
+    extents.addPoint(AcGePoint3d(1000.0, 1000.0, 0.0));
+    return Acad::eOk;
+}
+
 Acad::ErrorStatus AcDbBlockTableRecord::appendAcDbEntity(AcDbObjectId& id, AcDbEntity* pEntity)
 {
     if (pEntity == nullptr)
@@ -383,19 +569,45 @@ AcDbObjectId AcDbEntity::layerId() const
 Acad::ErrorStatus AcDbBlockTable::getAt(const ACHAR* entryName, AcDbBlockTableRecord*& pRec,
                                         AcDb::OpenMode openMode, bool /*openErasedRec*/) const
 {
-    if (std::wcscmp(entryName, ACDB_MODEL_SPACE) != 0 || modelSpace == nullptr)
+    getAtCalls++;
+    if (entryName == nullptr)
+        return Acad::eInvalidInput;
+    AcDbBlockTableRecord* pFound = nullptr;
+    if (modelSpace != nullptr && sameSymbolName(ACDB_MODEL_SPACE, entryName))
+        pFound = modelSpace;
+    for (AcDbSymbolTableRecord* pRecord : records)
+        if (pFound == nullptr && sameSymbolName(pRecord->mockName(), entryName))
+            pFound = static_cast<AcDbBlockTableRecord*>(pRecord);
+    if (pFound == nullptr)
         return Acad::eKeyNotFound;
     lastOpenMode = openMode;
-    pRec = modelSpace;
+    pRec = pFound;
+    pRec->mockOpened();
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus AcDbBlockTable::newIterator(AcDbBlockTableIterator*& pIterator, bool atBeginning,
+                                              bool skipDeleted) const
+{
+    // Пространство модели идёт первым, как в AutoCAD.
+    std::vector<AcDbSymbolTableRecord*> all;
+    if (modelSpace)
+        all.push_back(modelSpace);
+    all.insert(all.end(), records.begin(), records.end());
+    pIterator = new AcDbBlockTableIterator(all);
+    pIterator->start(atBeginning, skipDeleted);
     return Acad::eOk;
 }
 
 AcDbDatabase::AcDbDatabase()
-    : layerTable(this)
+    : blockTable(this)
+    , layerTable(this)
     , textStyleTable(this)
     , clayer(L"0")
 {
     blockTable.modelSpace = &modelSpace;
+    modelSpace.mockSetName(ACDB_MODEL_SPACE);
+    modelSpace.mockIsLayout = true;
     modelSpace.mockAttach(this, newObjectId());
     mockAddLayer(L"0");
     mockAddTextStyle(L"Standard");
@@ -440,6 +652,19 @@ AcDbObjectId AcDbDatabase::mockAddTextStyle(const ACHAR* name, bool isShapeFile)
     return pRecord->objectId();
 }
 
+AcDbBlockTableRecord* AcDbDatabase::mockAddBlock(const ACHAR* name)
+{
+    AcDbBlockTableRecord* pRecord = new AcDbBlockTableRecord();
+    pRecord->mockSetName(name);
+    if (blockTable.add(pRecord) != Acad::eOk)
+    {
+        delete pRecord;
+        return nullptr;
+    }
+    blockTable.addCalls--;
+    return pRecord;
+}
+
 AcDbDatabase::~AcDbDatabase()
 {
 }
@@ -447,6 +672,7 @@ AcDbDatabase::~AcDbDatabase()
 Acad::ErrorStatus AcDbDatabase::getBlockTable(AcDbBlockTable*& pTable, AcDb::OpenMode /*mode*/)
 {
     pTable = &blockTable;
+    pTable->mockOpened();
     return Acad::eOk;
 }
 

@@ -21,6 +21,8 @@ set(COPIED_DIR ${CMAKE_CURRENT_BINARY_DIR}/src)
 set(PRODUCT_FILES
     MyDevice.h
     MyDevice.cpp
+    MyDeviceBlock.h
+    MyDeviceBlock.cpp
     MyDeviceCommand.h
     MyDeviceCommand.cpp
     MyDeviceOPM.h

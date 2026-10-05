@@ -14,8 +14,17 @@
 //  * все свойства сохраняются в DWG/DXF (версия 2), данные версии 1 читаются;
 //  * палитра свойств: категории «Text 1»/«Text 2» по шесть свойств, чтение и запись
 //    значений, создание отсутствующего слоя, выбор только существующего стиля.
+//
+// и этапа 3:
+//  * BlockName: блок рисуется базовой точкой в локальном начале MyDevice
+//    и преобразуется вместе с объектом; отсутствующий блок — «BLOCK NOT FOUND»;
+//  * Visibility есть только у Dynamic Block с параметром видимости, значение —
+//    его состояние; смена BlockName заново определяет тип блока и состояния;
+//  * BlockName и Visibility сохраняются в DWG/DXF (версия 3), версии 1 и 2 читаются;
+//  * после открытия чертежа тип блока и состояние определяются заново.
 #include "StdAfx.h"
 #include "MyDevice.h"
+#include "MyDeviceBlock.h"
 #include "MyDeviceCommand.h"
 #include "MyDeviceProperties.h"
 #include "mock_filers.h"
@@ -1544,6 +1553,875 @@ TEST(Stage2_Properties_ChangesSurviveSaveAndReopen)
     CHECK_NEAR(P::getDouble(*pReopened, MyDevice::kText1, P::kPositionY), 22.0, kTol);
     CHECK_WSTR(P::getString(*pReopened, MyDevice::kText2, P::kFont).kACharPtr(), L"GOST");
     delete pObj;
+}
+
+// ---------------------------------------------------------------------------
+// Этап 3: блок и Visibility внутри MyDevice
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    AcDbDatabase* workingDb()
+    {
+        return acdbHostApplicationServices()->workingDatabase();
+    }
+
+    AcDbObjectId addLine(AcDbBlockTableRecord* pBlock, const AcGePoint3d& start, const AcGePoint3d& end)
+    {
+        AcDbObjectId id;
+        pBlock->appendAcDbEntity(id, new AcDbLine(start, end));
+        return id;
+    }
+
+    // Обычный блок: два отрезка и определение атрибута, базовая точка (5, 5, 0).
+    AcDbBlockTableRecord* addPlainBlock(const ACHAR* name)
+    {
+        AcDbBlockTableRecord* pBlock = workingDb()->mockAddBlock(name);
+        pBlock->mockOrigin.set(5.0, 5.0, 0.0);
+        addLine(pBlock, AcGePoint3d(5.0, 5.0, 0.0), AcGePoint3d(25.0, 5.0, 0.0));
+        addLine(pBlock, AcGePoint3d(5.0, 5.0, 0.0), AcGePoint3d(5.0, 15.0, 0.0));
+        AcDbObjectId id;
+        pBlock->appendAcDbEntity(id, new AcDbAttributeDefinition(L"TAG"));
+        return pBlock;
+    }
+
+    struct VisibilityState
+    {
+        const wchar_t* name;
+        std::vector<AcDbObjectId> visible;
+    };
+
+    // Делает блок динамическим с параметром видимости в том виде, в каком его
+    // возвращает acdbEntGet(): словарь расширений -> ACAD_ENHANCEDBLOCK (граф)
+    // -> узел BLOCKVISIBILITYPARAMETER. Группы и их порядок — как в DXF AutoCAD;
+    // перед подклассом параметра видимости есть «чужая» группа 301.
+    void addVisibilityParameter(AcDbBlockTableRecord* pBlock, const wchar_t* parameterName,
+                                const std::vector<AcDbObjectId>& controlled,
+                                const std::vector<VisibilityState>& states)
+    {
+        typedef mock::DxfGroup G;
+        pBlock->mockIsDynamic = true;
+        const AcDbObjectId dictionary = mock::newId();
+        const AcDbObjectId graph = mock::newId();
+        const AcDbObjectId purgePreventer = mock::newId();
+        const AcDbObjectId grip = mock::newId();
+        const AcDbObjectId parameter = mock::newId();
+        pBlock->mockSetExtensionDictionary(dictionary);
+        mock::setEntGet(dictionary, { G::text(0, L"DICTIONARY"), G::text(100, L"AcDbDictionary"),
+                                      G::text(3, L"ACAD_ENHANCEDBLOCK"), G::name(360, graph),
+                                      G::text(3, L"AcDbDynamicBlockRoundTripPurgePreventer"),
+                                      G::name(360, purgePreventer) });
+        mock::setEntGet(graph, { G::text(0, L"ACAD_EVALUATION_GRAPH"), G::text(100, L"AcDbEvalGraph"),
+                                 G::name(360, grip), G::name(360, parameter) });
+        mock::setEntGet(grip, { G::text(0, L"BLOCKGRIPLOCATIONCOMPONENT"), G::text(301, L"UpdatedX") });
+
+        std::vector<G> groups = {
+            G::text(0, L"BLOCKVISIBILITYPARAMETER"), G::text(100, L"AcDbEvalExpr"),
+            G::text(100, L"AcDbBlockElement"), G::text(300, L"Visibility"),
+            G::text(100, L"AcDbBlockParameter"), G::text(100, L"AcDbBlock1PtParameter"),
+            G::int16(93, 2), G::int16(170, 1), G::int16(91, 0), G::text(301, L"UpdatedX"),
+            G::int16(171, 0),
+            G::text(100, L"AcDbBlockVisibilityParameter"), G::int16(281, 1),
+            G::text(301, parameterName), G::text(302, L""), G::int16(91, 0),
+            G::int16(93, static_cast<short>(controlled.size())) };
+        for (const AcDbObjectId& id : controlled)
+            groups.push_back(G::name(331, id));
+        groups.push_back(G::int16(92, static_cast<short>(states.size())));
+        for (const VisibilityState& state : states)
+        {
+            groups.push_back(G::text(303, state.name));
+            groups.push_back(G::int16(94, static_cast<short>(state.visible.size())));
+            for (const AcDbObjectId& id : state.visible)
+                groups.push_back(G::name(332, id));
+            groups.push_back(G::int16(95, 0));
+        }
+        mock::setEntGet(parameter, groups);
+    }
+
+    // Динамический блок DEVICE_DYNAMIC: отрезок «Front», отрезок «Side» и общий отрезок.
+    // Состояния: Front (по умолчанию) и Side. Базовая точка (0, 0, 0).
+    struct DynamicBlock
+    {
+        AcDbBlockTableRecord* pBlock;
+        AcDbObjectId front, side, common;
+    };
+
+    DynamicBlock addDynamicBlock(const ACHAR* name = L"DEVICE_DYNAMIC")
+    {
+        DynamicBlock b;
+        b.pBlock = workingDb()->mockAddBlock(name);
+        b.front = addLine(b.pBlock, AcGePoint3d(0.0, 0.0, 0.0), AcGePoint3d(10.0, 0.0, 0.0));
+        b.side = addLine(b.pBlock, AcGePoint3d(0.0, 0.0, 0.0), AcGePoint3d(0.0, -100.0, 0.0));
+        b.common = addLine(b.pBlock, AcGePoint3d(1.0, 1.0, 0.0), AcGePoint3d(2.0, 2.0, 0.0));
+        addVisibilityParameter(b.pBlock, L"Visibility1", { b.front, b.side },
+                               { { L"Front", { b.front } }, { L"Side", { b.side } } });
+        return b;
+    }
+
+    // Динамический блок без параметра видимости (например, только с растяжением).
+    AcDbBlockTableRecord* addDynamicBlockWithoutVisibility(const ACHAR* name)
+    {
+        AcDbBlockTableRecord* pBlock = workingDb()->mockAddBlock(name);
+        addLine(pBlock, AcGePoint3d(0.0, 0.0, 0.0), AcGePoint3d(30.0, 0.0, 0.0));
+        pBlock->mockIsDynamic = true;
+        typedef mock::DxfGroup G;
+        const AcDbObjectId dictionary = mock::newId();
+        const AcDbObjectId graph = mock::newId();
+        const AcDbObjectId stretch = mock::newId();
+        pBlock->mockSetExtensionDictionary(dictionary);
+        mock::setEntGet(dictionary, { G::text(0, L"DICTIONARY"), G::text(3, L"ACAD_ENHANCEDBLOCK"),
+                                      G::name(360, graph) });
+        mock::setEntGet(graph, { G::text(0, L"ACAD_EVALUATION_GRAPH"), G::name(360, stretch) });
+        mock::setEntGet(stretch, { G::text(0, L"BLOCKLINEARPARAMETER"), G::text(305, L"Distance1"),
+                                   G::text(303, L"NotAVisibilityState") });
+        return pBlock;
+    }
+
+    // MyDevice в пространстве модели рабочей базы (владеет база).
+    MyDevice* appendDevice(const AcGePoint3d& position = AcGePoint3d(100.0, 200.0, 0.0))
+    {
+        MyDevice* pDevice = new MyDevice(position);
+        AcDbObjectId id;
+        modelSpace().appendAcDbEntity(id, pDevice);
+        return pDevice;
+    }
+
+    // Нарисованные примитивы определения блока (в порядке отрисовки).
+    std::vector<const AcGiDrawable*> drawnObjects(const RecordingWorldDraw& wd)
+    {
+        std::vector<const AcGiDrawable*> result;
+        for (const RecordingWorldDraw::Drawn& d : wd.drawn)
+            result.push_back(d.drawable);
+        return result;
+    }
+
+    const AcGiDrawable* entityOf(AcDbBlockTableRecord* pBlock, const AcDbObjectId& id)
+    {
+        for (AcDbEntity* pEntity : pBlock->entities)
+            if (pEntity->objectId() == id)
+                return pEntity;
+        return nullptr;
+    }
+
+    // Все объекты, открытые при отрисовке и вычислении границ, закрыты.
+    void checkBlockClosed(const char* file, int line, const AcDbBlockTableRecord* pBlock)
+    {
+        if (pBlock->openCount() != pBlock->closeCount())
+            testing::fail(file, line, "block definition left open");
+        for (const AcDbEntity* pEntity : pBlock->entities)
+            if (pEntity->openCount() != pEntity->closeCount())
+                testing::fail(file, line, "block entity left open");
+    }
+
+    bool printedContains(const wchar_t* fragment)
+    {
+        for (const std::wstring& line : mock::printed)
+            if (line.find(fragment) != std::wstring::npos)
+                return true;
+        return false;
+    }
+
+    // Значения отслеживаемых свойств, которые MyDevice сохраняет в DWG/DXF.
+    void checkSameBlock(const char* file, int line, const MyDevice& actual, const MyDevice& expected)
+    {
+        if (!(actual.blockName() == expected.blockName()))
+            testing::fail(file, line, "BlockName differs: " + testing::narrow(actual.blockName().kACharPtr()));
+        if (!(actual.visibility() == expected.visibility()))
+            testing::fail(file, line, "Visibility differs: " + testing::narrow(actual.visibility().kACharPtr()));
+    }
+}
+
+#define CHECK_BLOCK_CLOSED(b) checkBlockClosed(__FILE__, __LINE__, (b))
+#define CHECK_SAME_BLOCK(a, e) checkSameBlock(__FILE__, __LINE__, (a), (e))
+
+TEST(Stage3_Defaults_NoBlock)
+{
+    mock::reset();
+    MyDevice device;
+    CHECK(device.blockName().isEmpty());
+    CHECK(device.visibility().isEmpty());
+    CHECK(!MyDeviceProperties::hasVisibility(device));
+
+    RecordingWorldDraw wd;
+    device.worldDraw(&wd);
+    // Без блока — только прямоугольник и два текста, как на этапе 2.
+    CHECK_EQ(wd.polylines.size(), static_cast<size_t>(1));
+    CHECK_EQ(wd.texts.size(), static_cast<size_t>(2));
+    CHECK(wd.drawn.empty());
+    CHECK_EQ(wd.pushCalls, 0);
+    CHECK_EQ(mock::entGetCalls, 0);
+}
+
+TEST(Stage3_Draw_OrdinaryBlockBasePointAtLocalOrigin)
+{
+    mock::reset();
+    workingDb()->mockAddLayer(L"DEVICES");
+    AcDbBlockTableRecord* pBlock = addPlainBlock(L"DEVICE_01");
+    MyDevice* pDevice = appendDevice();
+    pDevice->setLayer(L"DEVICES");
+    pDevice->setOrientation(AcGeVector3d::kYAxis, AcGeVector3d::kZAxis);
+    pDevice->setScale(2.0);
+    CHECK_EQ(pDevice->setBlockName(L"DEVICE_01"), Acad::eOk);
+    CHECK_WSTR(pDevice->blockName().kACharPtr(), L"DEVICE_01");
+    // У обычного блока Visibility нет.
+    CHECK(pDevice->visibility().isEmpty());
+    CHECK(!MyDeviceProperties::hasVisibility(*pDevice));
+
+    RecordingWorldDraw wd;
+    pDevice->worldDraw(&wd);
+
+    // Прямоугольник, затем примитивы блока, затем тексты.
+    CHECK_EQ(wd.texts.size(), static_cast<size_t>(2));
+    CHECK_EQ(wd.polylines.size(), static_cast<size_t>(3));
+    // Определение атрибута не рисуется (его тег — не графика блока).
+    CHECK_EQ(wd.drawn.size(), static_cast<size_t>(2));
+    for (const RecordingWorldDraw::Text& t : wd.texts)
+        CHECK(t.message != L"TAG");
+    if (wd.polylines.size() == 3)
+    {
+        // Базовая точка блока (5, 5) совпадает с локальным началом MyDevice,
+        // блок повёрнут и масштабирован вместе с объектом.
+        const std::vector<AcGePoint3d> line1 = wd.polylines[1].worldPoints();
+        const std::vector<AcGePoint3d> line2 = wd.polylines[2].worldPoints();
+        CHECK_POINT(line1[0], AcGePoint3d(100.0, 200.0, 0.0));
+        CHECK_POINT(line1[1], AcGePoint3d(100.0, 240.0, 0.0));
+        CHECK_POINT(line2[1], AcGePoint3d(80.0, 200.0, 0.0));
+        CHECK(wd.polylines[1].layerId == findLayerId(L"DEVICES"));
+    }
+    if (!wd.drawn.empty())
+        CHECK(wd.drawn[0].layerId == findLayerId(L"DEVICES"));
+    // Матрица модели снята, база данных не изменилась, всё открытое закрыто.
+    CHECK_EQ(wd.pushCalls, 1);
+    CHECK_EQ(wd.popCalls, 1);
+    CHECK(wd.transforms.empty());
+    CHECK_EQ(workingDb()->blockTable.addCalls, 0);
+    CHECK_EQ(workingDb()->blockTable.lastOpenMode, AcDb::kForRead);
+    CHECK_BLOCK_CLOSED(pBlock);
+    CHECK_EQ(workingDb()->blockTable.openCount(), workingDb()->blockTable.closeCount());
+}
+
+TEST(Stage3_Draw_BlockFollowsMoveRotateScale)
+{
+    mock::reset();
+    addPlainBlock(L"DEVICE_01");
+    MyDevice* pDevice = appendDevice(AcGePoint3d(10.0, 0.0, 0.0));
+    CHECK_EQ(pDevice->setBlockName(L"DEVICE_01"), Acad::eOk);
+
+    CHECK_EQ(pDevice->transformBy(AcGeMatrix3d::translation(AcGeVector3d(0.0, 5.0, 0.0))), Acad::eOk);
+    CHECK_EQ(pDevice->transformBy(AcGeMatrix3d::rotation(kPi / 2.0, AcGeVector3d::kZAxis)), Acad::eOk);
+    CHECK_EQ(pDevice->transformBy(AcGeMatrix3d::scaling(3.0)), Acad::eOk);
+    // Точка вставки: (10, 0) -> (10, 5) -> (-5, 10) -> (-15, 30).
+    CHECK_POINT(pDevice->position(), AcGePoint3d(-15.0, 30.0, 0.0));
+
+    RecordingWorldDraw wd;
+    pDevice->worldDraw(&wd);
+    CHECK_EQ(wd.polylines.size(), static_cast<size_t>(3));
+    if (wd.polylines.size() == 3)
+    {
+        const std::vector<AcGePoint3d> line1 = wd.polylines[1].worldPoints();
+        CHECK_POINT(line1[0], AcGePoint3d(-15.0, 30.0, 0.0));
+        // Отрезок длиной 20 вдоль локальной X: после поворота на 90° и масштаба 3 — 60 вдоль МСК Y.
+        CHECK_POINT(line1[1], AcGePoint3d(-15.0, 90.0, 0.0));
+    }
+    // Положение блока — не отдельное свойство: после преобразований
+    // оно по-прежнему совпадает с точкой вставки MyDevice.
+    if (!wd.drawn.empty())
+    {
+        AcGeMatrix3d expected = pDevice->localToWorld()
+            * AcGeMatrix3d::translation(AcGePoint3d::kOrigin - AcGePoint3d(5.0, 5.0, 0.0));
+        AcGePoint3d probe(7.0, 11.0, 0.0), probeExpected(7.0, 11.0, 0.0);
+        probe.transformBy(wd.drawn[0].transform);
+        probeExpected.transformBy(expected);
+        CHECK_POINT(probe, probeExpected);
+    }
+}
+
+TEST(Stage3_Draw_MissingBlockShowsBlockNotFound)
+{
+    mock::reset();
+    workingDb()->mockAddLayer(L"DEVICES");
+    MyDevice* pDevice = appendDevice();
+    pDevice->setLayer(L"DEVICES");
+    pDevice->setScale(2.0);
+    const size_t blocks = workingDb()->blockTable.records.size();
+    CHECK_EQ(pDevice->setBlockName(L"NO_SUCH_BLOCK"), Acad::eOk);
+    CHECK_WSTR(pDevice->blockName().kACharPtr(), L"NO_SUCH_BLOCK");
+    CHECK(pDevice->visibility().isEmpty());
+    CHECK(!MyDeviceProperties::hasVisibility(*pDevice));
+
+    RecordingWorldDraw wd;
+    pDevice->worldDraw(&wd);
+    CHECK(wd.drawn.empty());
+    CHECK_EQ(wd.pushCalls, 0);
+    CHECK_EQ(wd.polylines.size(), static_cast<size_t>(1));
+    CHECK_EQ(wd.texts.size(), static_cast<size_t>(3));
+    bool found = false;
+    for (const RecordingWorldDraw::Text& t : wd.texts)
+    {
+        if (t.message != L"BLOCK NOT FOUND")
+            continue;
+        found = true;
+        // В базовой точке блока, на слое MyDevice, с учётом масштаба.
+        CHECK_POINT(t.position, AcGePoint3d(100.0, 200.0, 0.0));
+        CHECK_NEAR(t.height, MyDevice::kNotFoundTextHeight * 2.0, kTol);
+        CHECK(t.layerId == findLayerId(L"DEVICES"));
+        CHECK_WSTR(t.styleName, L"Standard");
+    }
+    CHECK(found);
+    // Отсутствие блока не меняет чертёж и не повреждает объект.
+    CHECK_EQ(workingDb()->blockTable.records.size(), blocks);
+    CHECK_EQ(workingDb()->blockTable.addCalls, 0);
+    CHECK_WSTR(pDevice->text1().kACharPtr(), L"TEXT1");
+    AcDbExtents extents;
+    CHECK_EQ(pDevice->getGeomExtents(extents), Acad::eOk);
+    MemoryDwgFiler dwg;
+    CHECK_EQ(pDevice->dwgOutFields(&dwg), Acad::eOk);
+}
+
+TEST(Stage3_Draw_LayoutAnonymousAndXrefBlocksAreNotShown)
+{
+    mock::reset();
+    AcDbBlockTableRecord* pPaper = workingDb()->mockAddBlock(L"*Paper_Space");
+    pPaper->mockIsLayout = true;
+    addLine(pPaper, AcGePoint3d::kOrigin, AcGePoint3d(1.0, 0.0, 0.0));
+    AcDbBlockTableRecord* pAnonymous = workingDb()->mockAddBlock(L"*U1");
+    pAnonymous->mockIsAnonymous = true;
+    addLine(pAnonymous, AcGePoint3d::kOrigin, AcGePoint3d(1.0, 0.0, 0.0));
+    AcDbBlockTableRecord* pXref = workingDb()->mockAddBlock(L"PLAN");
+    pXref->mockIsXref = true;
+    MyDevice* pDevice = appendDevice();
+
+    const wchar_t* names[] = { L"*Model_Space", L"*Paper_Space", L"*U1", L"PLAN" };
+    for (const wchar_t* name : names)
+    {
+        CHECK_EQ(pDevice->setBlockName(name), Acad::eOk);
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        // Пространство модели содержит сам MyDevice: рисовать его — бесконечная рекурсия.
+        CHECK(wd.drawn.empty());
+        CHECK(!wd.depthExceeded);
+        CHECK_EQ(wd.texts.size(), static_cast<size_t>(3));
+    }
+    CHECK_BLOCK_CLOSED(pPaper);
+    CHECK_BLOCK_CLOSED(pAnonymous);
+    CHECK_EQ(modelSpace().openCount(), modelSpace().closeCount());
+}
+
+TEST(Stage3_Dynamic_DefaultVisibilityStateAndSwitching)
+{
+    mock::reset();
+    DynamicBlock b = addDynamicBlock();
+    MyDevice* pDevice = appendDevice();
+    CHECK_EQ(pDevice->setBlockName(L"DEVICE_DYNAMIC"), Acad::eOk);
+    CHECK(MyDeviceProperties::hasVisibility(*pDevice));
+    // Состояние по умолчанию — первое в списке параметра видимости.
+    CHECK_WSTR(pDevice->visibility().kACharPtr(), L"Front");
+    CHECK_WSTR(MyDeviceProperties::visibility(*pDevice).kACharPtr(), L"Front");
+
+    {
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        const std::vector<const AcGiDrawable*> drawn = drawnObjects(wd);
+        CHECK_EQ(drawn.size(), static_cast<size_t>(2));
+        if (drawn.size() == 2)
+        {
+            CHECK(drawn[0] == entityOf(b.pBlock, b.front));
+            CHECK(drawn[1] == entityOf(b.pBlock, b.common));
+        }
+    }
+
+    CHECK_EQ(pDevice->setVisibility(L"Side"), Acad::eOk);
+    CHECK_WSTR(pDevice->visibility().kACharPtr(), L"Side");
+    {
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        const std::vector<const AcGiDrawable*> drawn = drawnObjects(wd);
+        CHECK_EQ(drawn.size(), static_cast<size_t>(2));
+        if (drawn.size() == 2)
+        {
+            CHECK(drawn[0] == entityOf(b.pBlock, b.side));
+            CHECK(drawn[1] == entityOf(b.pBlock, b.common));
+        }
+    }
+    CHECK_BLOCK_CLOSED(b.pBlock);
+    // Все списки acdbEntGet() освобождены.
+    CHECK(mock::entGetCalls > 0);
+    CHECK_EQ(mock::liveResbufs, 0);
+}
+
+TEST(Stage3_Dynamic_ParameterReadFromVisibilitySubclass)
+{
+    mock::reset();
+    DynamicBlock b = addDynamicBlock();
+    MyDeviceBlock::Info info;
+    CHECK_EQ(MyDeviceBlock::find(workingDb(), L"device_dynamic", info), Acad::eOk);
+    CHECK(info.kind == MyDeviceBlock::kDynamic);
+    CHECK(info.blockId == b.pBlock->objectId());
+    CHECK(info.hasVisibility);
+    // Имя берётся из подкласса AcDbBlockVisibilityParameter, а не из первой группы 301.
+    CHECK_WSTR(info.parameterName.kACharPtr(), L"Visibility1");
+    CHECK_EQ(info.controlled.size(), static_cast<size_t>(2));
+    CHECK_EQ(info.states.size(), static_cast<size_t>(2));
+    if (info.states.size() == 2)
+    {
+        CHECK_WSTR(info.states[0].name.kACharPtr(), L"Front");
+        CHECK_WSTR(info.states[1].name.kACharPtr(), L"Side");
+        CHECK_EQ(info.states[1].visible.size(), static_cast<size_t>(1));
+    }
+    CHECK_EQ(info.findState(L"Side"), 1);
+    CHECK_EQ(info.findState(L"Top"), -1);
+    CHECK_EQ(info.effectiveState(L"Side"), 1);
+    CHECK_EQ(info.effectiveState(L"Top"), 0);
+    CHECK_EQ(info.effectiveState(L""), 0);
+    // Отрезок вне параметра видимости виден всегда.
+    CHECK(info.isVisible(b.common, 0) && info.isVisible(b.common, 1));
+    CHECK(info.isVisible(b.front, 0) && !info.isVisible(b.front, 1));
+    CHECK(!info.isVisible(b.side, 0) && info.isVisible(b.side, 1));
+    CHECK_EQ(mock::liveResbufs, 0);
+
+    CHECK_EQ(MyDeviceBlock::find(workingDb(), L"NONE", info), Acad::eKeyNotFound);
+    CHECK(info.kind == MyDeviceBlock::kNotFound);
+    CHECK(!info.hasVisibility);
+    CHECK_EQ(MyDeviceBlock::find(nullptr, L"DEVICE_DYNAMIC", info), Acad::eNullObjectPointer);
+    CHECK(info.kind == MyDeviceBlock::kNotFound);
+}
+
+TEST(Stage3_Dynamic_BrokenVisibilityDataIsIgnoredSafely)
+{
+    mock::reset();
+    // Динамический блок без словаря расширений и с графом без узлов.
+    AcDbBlockTableRecord* pNoDictionary = workingDb()->mockAddBlock(L"NO_DICT");
+    pNoDictionary->mockIsDynamic = true;
+    addLine(pNoDictionary, AcGePoint3d::kOrigin, AcGePoint3d(1.0, 0.0, 0.0));
+    AcDbBlockTableRecord* pEmptyGraph = workingDb()->mockAddBlock(L"EMPTY_GRAPH");
+    pEmptyGraph->mockIsDynamic = true;
+    const AcDbObjectId dictionary = mock::newId();
+    pEmptyGraph->mockSetExtensionDictionary(dictionary);
+    // Запись ACAD_ENHANCEDBLOCK указывает на объект, которого нет (acdbEntGet вернёт nullptr).
+    mock::setEntGet(dictionary, { mock::DxfGroup::text(3, L"ACAD_ENHANCEDBLOCK"),
+                                  mock::DxfGroup::name(360, mock::newId()) });
+    // Параметр видимости без состояний.
+    AcDbBlockTableRecord* pNoStates = workingDb()->mockAddBlock(L"NO_STATES");
+    addVisibilityParameter(pNoStates, L"Visibility1", {}, {});
+
+    const wchar_t* names[] = { L"NO_DICT", L"EMPTY_GRAPH", L"NO_STATES" };
+    for (const wchar_t* name : names)
+    {
+        MyDeviceBlock::Info info;
+        CHECK_EQ(MyDeviceBlock::find(workingDb(), name, info), Acad::eOk);
+        CHECK(info.kind == MyDeviceBlock::kDynamic);
+        CHECK(!info.hasVisibility);
+        MyDevice device;
+        CHECK_EQ(device.setBlockName(name), Acad::eOk);
+        CHECK(device.visibility().isEmpty());
+        CHECK_EQ(device.setVisibility(L"Front"), Acad::eNotApplicable);
+    }
+    CHECK_EQ(mock::liveResbufs, 0);
+}
+
+TEST(Stage3_BlockName_SwitchUpdatesVisibility)
+{
+    mock::reset();
+    addPlainBlock(L"DEVICE_A");
+    DynamicBlock b = addDynamicBlock(L"DEVICE_B");
+    AcDbBlockTableRecord* pNoVisibility = addDynamicBlockWithoutVisibility(L"DEVICE_C");
+    MyDevice* pDevice = appendDevice();
+    typedef MyDeviceProperties P;
+
+    // DEVICE_A — обычный блок: Visibility недоступно.
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_A"), Acad::eOk);
+    CHECK(!P::hasVisibility(*pDevice));
+    CHECK(P::visibility(*pDevice).isEmpty());
+    CHECK_EQ(P::setVisibility(*pDevice, L"Front"), Acad::eNotApplicable);
+
+    // DEVICE_B — Dynamic Block: список состояний получен заново.
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_B"), Acad::eOk);
+    CHECK(P::hasVisibility(*pDevice));
+    std::vector<AcString> states;
+    CHECK_EQ(P::visibilityStates(*pDevice, states), Acad::eOk);
+    CHECK_EQ(states.size(), static_cast<size_t>(2));
+    CHECK_WSTR(P::visibility(*pDevice).kACharPtr(), L"Front");
+    CHECK_EQ(P::setVisibility(*pDevice, L"Side"), Acad::eOk);
+    CHECK_WSTR(P::visibility(*pDevice).kACharPtr(), L"Side");
+    {
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(2));
+        if (!wd.drawn.empty())
+            CHECK(wd.drawn[0].drawable == entityOf(b.pBlock, b.side));
+    }
+
+    // Обратно на обычный блок: Visibility исчезает и больше не хранится.
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_A"), Acad::eOk);
+    CHECK(!P::hasVisibility(*pDevice));
+    CHECK(pDevice->visibility().isEmpty());
+    CHECK_EQ(P::visibilityStates(*pDevice, states), Acad::eOk);
+    CHECK(states.empty());
+    {
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(2));
+    }
+
+    // Повторный выбор DEVICE_B начинается с состояния по умолчанию.
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_B"), Acad::eOk);
+    CHECK_WSTR(P::visibility(*pDevice).kACharPtr(), L"Front");
+    // Выбор того же блока ещё раз (палитра записывает значение повторно) состояние не сбрасывает.
+    CHECK_EQ(P::setVisibility(*pDevice, L"Side"), Acad::eOk);
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_B"), Acad::eOk);
+    CHECK_WSTR(P::visibility(*pDevice).kACharPtr(), L"Side");
+
+    // DEVICE_C — Dynamic Block без параметра видимости: Visibility не предоставляется.
+    CHECK_EQ(P::setBlockName(*pDevice, L"DEVICE_C"), Acad::eOk);
+    CHECK(!P::hasVisibility(*pDevice));
+    CHECK(pDevice->visibility().isEmpty());
+    {
+        RecordingWorldDraw wd;
+        pDevice->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(1));
+    }
+    CHECK_WSTR(P::blockName(*pDevice).kACharPtr(), L"DEVICE_C");
+
+    // Пустое имя — блока нет, ничего не рисуется.
+    CHECK_EQ(P::setBlockName(*pDevice, L""), Acad::eOk);
+    CHECK(!P::hasVisibility(*pDevice));
+    CHECK_BLOCK_CLOSED(pNoVisibility);
+    CHECK_EQ(mock::liveResbufs, 0);
+}
+
+TEST(Stage3_Visibility_SetRejectsInvalidValues)
+{
+    mock::reset();
+    addPlainBlock(L"DEVICE_01");
+    addDynamicBlock();
+    MyDevice* pDevice = appendDevice();
+
+    // Нет блока, блок не найден, обычный блок — Visibility неприменимо.
+    CHECK_EQ(pDevice->setVisibility(L"Front"), Acad::eNotApplicable);
+    pDevice->setBlockName(L"NO_SUCH_BLOCK");
+    CHECK_EQ(pDevice->setVisibility(L"Front"), Acad::eNotApplicable);
+    pDevice->setBlockName(L"DEVICE_01");
+    CHECK_EQ(pDevice->setVisibility(L"Front"), Acad::eNotApplicable);
+    CHECK(pDevice->visibility().isEmpty());
+
+    // Неизвестное состояние отклоняется, текущее не меняется.
+    pDevice->setBlockName(L"DEVICE_DYNAMIC");
+    CHECK_EQ(pDevice->setVisibility(L"Side"), Acad::eOk);
+    CHECK_EQ(pDevice->setVisibility(L"Top"), Acad::eInvalidInput);
+    CHECK_EQ(pDevice->setVisibility(L""), Acad::eInvalidInput);
+    CHECK_WSTR(pDevice->visibility().kACharPtr(), L"Side");
+}
+
+TEST(Stage3_Dwg_RoundTripVersion3)
+{
+    mock::reset();
+    addDynamicBlock();
+    MyDevice* pDevice = appendDevice();
+    CHECK_EQ(MyDevice::kCurrentVersion, 3);
+    CHECK_EQ(pDevice->setBlockName(L"DEVICE_DYNAMIC"), Acad::eOk);
+    CHECK_EQ(pDevice->setVisibility(L"Side"), Acad::eOk);
+
+    MemoryDwgFiler dwg;
+    CHECK_EQ(pDevice->dwgOutFields(&dwg), Acad::eOk);
+    CHECK_EQ(dwg.items[1].i, 3);
+    // Версия 3 дописывает BlockName и Visibility после полей версии 2.
+    const size_t n = dwg.items.size();
+    CHECK(dwg.items[n - 2].str == L"DEVICE_DYNAMIC");
+    CHECK(dwg.items[n - 1].str == L"Side");
+
+    AcRxObject* pObj = MyDevice::desc()->create();
+    MyDevice* pReopened = MyDevice::cast(pObj);
+    dwg.rewind();
+    CHECK_EQ(pReopened->dwgInFields(&dwg), Acad::eOk);
+    CHECK_EQ(dwg.cursor, dwg.items.size());
+    CHECK_SAME_DEVICE(*pReopened, *pDevice);
+    CHECK_SAME_BLOCK(*pReopened, *pDevice);
+    delete pObj;
+}
+
+TEST(Stage3_Dwg_OlderVersionsReadWithoutBlock)
+{
+    mock::reset();
+    MyDevice* pDevice = makeCustomDevice();
+    MemoryDwgFiler dwg;
+    CHECK_EQ(pDevice->dwgOutFields(&dwg), Acad::eOk);
+    // Данные версии 2: без двух последних строк.
+    dwg.items.resize(dwg.items.size() - 2);
+    dwg.items[1].i = 2;
+
+    MyDevice reopened;
+    reopened.setBlockName(L"STALE");
+    dwg.rewind();
+    CHECK_EQ(reopened.dwgInFields(&dwg), Acad::eOk);
+    CHECK_EQ(dwg.cursor, dwg.items.size());
+    CHECK_SAME_DEVICE(reopened, *pDevice);
+    CHECK(reopened.blockName().isEmpty());
+    CHECK(reopened.visibility().isEmpty());
+
+    // Обрезанные данные версии 3 не читаются и не портят объект.
+    MemoryDwgFiler truncated;
+    pDevice->setBlockName(L"DEVICE_01");
+    CHECK_EQ(pDevice->dwgOutFields(&truncated), Acad::eOk);
+    truncated.items.pop_back();
+    MyDevice untouched;
+    truncated.rewind();
+    CHECK(untouched.dwgInFields(&truncated) != Acad::eOk);
+    CHECK(untouched.blockName().isEmpty());
+    delete pDevice;
+}
+
+TEST(Stage3_Dxf_RoundTripVersion3)
+{
+    mock::reset();
+    addDynamicBlock();
+    MyDevice* pDevice = appendDevice();
+    pDevice->setBlockName(L"DEVICE_DYNAMIC");
+    pDevice->setVisibility(L"Side");
+
+    MemoryDxfFiler dxf;
+    CHECK_EQ(pDevice->dxfOutFields(&dxf), Acad::eOk);
+    const MemoryDxfFiler::Item* pVersion = dxf.find(70);
+    CHECK(pVersion != nullptr && pVersion->i == 3);
+    const MemoryDxfFiler::Item* pName = dxf.find(306);
+    const MemoryDxfFiler::Item* pVisibility = dxf.find(307);
+    CHECK(pName != nullptr && pName->str == L"DEVICE_DYNAMIC");
+    CHECK(pVisibility != nullptr && pVisibility->str == L"Side");
+
+    MyDevice reopened;
+    dxf.rewind();
+    CHECK_EQ(reopened.dxfInFields(&dxf), Acad::eOk);
+    CHECK_SAME_DEVICE(reopened, *pDevice);
+    CHECK_SAME_BLOCK(reopened, *pDevice);
+
+    // DXF версии 2 (без групп 306/307) читается с пустым блоком.
+    MemoryDxfFiler v2;
+    for (const MemoryDxfFiler::Item& it : dxf.items)
+        if (it.code != 306 && it.code != 307)
+            v2.items.push_back(it);
+    for (MemoryDxfFiler::Item& it : v2.items)
+        if (it.code == 70)
+            it.i = 2;
+    MyDevice fromV2;
+    fromV2.setBlockName(L"STALE");
+    CHECK_EQ(fromV2.dxfInFields(&v2), Acad::eOk);
+    CHECK(fromV2.blockName().isEmpty());
+    CHECK(fromV2.visibility().isEmpty());
+}
+
+TEST(Stage3_Reopen_RedetectsBlockTypeAndRestoresVisibility)
+{
+    mock::reset();
+    DynamicBlock b = addDynamicBlock();
+    MyDevice* pDevice = appendDevice();
+    pDevice->setBlockName(L"DEVICE_DYNAMIC");
+    pDevice->setVisibility(L"Side");
+    MemoryDwgFiler dwg;
+    CHECK_EQ(pDevice->dwgOutFields(&dwg), Acad::eOk);
+
+    // Повторное открытие: тип блока и состояние определяются заново по чертежу.
+    MyDevice* pReopened = new MyDevice();
+    dwg.rewind();
+    CHECK_EQ(pReopened->dwgInFields(&dwg), Acad::eOk);
+    AcDbObjectId id;
+    modelSpace().appendAcDbEntity(id, pReopened);
+    CHECK(MyDeviceProperties::hasVisibility(*pReopened));
+    CHECK_WSTR(MyDeviceProperties::visibility(*pReopened).kACharPtr(), L"Side");
+    {
+        RecordingWorldDraw wd;
+        pReopened->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(2));
+        if (!wd.drawn.empty())
+            CHECK(wd.drawn[0].drawable == entityOf(b.pBlock, b.side));
+    }
+
+    // Сохранённого состояния больше нет (блок переопределён) — действует состояние по умолчанию.
+    MemoryDwgFiler renamed = dwg;
+    renamed.items.back().str = L"Removed";
+    MyDevice* pStale = new MyDevice();
+    renamed.rewind();
+    CHECK_EQ(pStale->dwgInFields(&renamed), Acad::eOk);
+    modelSpace().appendAcDbEntity(id, pStale);
+    CHECK_WSTR(pStale->visibility().kACharPtr(), L"Removed");
+    CHECK_WSTR(MyDeviceProperties::visibility(*pStale).kACharPtr(), L"Front");
+    {
+        RecordingWorldDraw wd;
+        pStale->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(2));
+        if (!wd.drawn.empty())
+            CHECK(wd.drawn[0].drawable == entityOf(b.pBlock, b.front));
+    }
+
+    // Блок стал обычным — Visibility не предоставляется, рисуются все примитивы.
+    b.pBlock->mockIsDynamic = false;
+    CHECK(!MyDeviceProperties::hasVisibility(*pReopened));
+    CHECK(MyDeviceProperties::visibility(*pReopened).isEmpty());
+    {
+        RecordingWorldDraw wd;
+        pReopened->worldDraw(&wd);
+        CHECK_EQ(wd.drawn.size(), static_cast<size_t>(3));
+    }
+    CHECK_EQ(mock::liveResbufs, 0);
+}
+
+TEST(Stage3_Extents_IncludeVisibleBlockEntities)
+{
+    mock::reset();
+    addDynamicBlock();
+    MyDevice* pDevice = appendDevice(AcGePoint3d::kOrigin);
+    pDevice->setBlockName(L"DEVICE_DYNAMIC");
+
+    // Front: блок внутри прямоугольника — границы прежние.
+    AcDbExtents front;
+    CHECK_EQ(pDevice->getGeomExtents(front), Acad::eOk);
+    CHECK_POINT(front.minPoint(), AcGePoint3d(0.0, 0.0, 0.0));
+
+    // Side: отрезок уходит на 100 вниз и учитывается в границах.
+    pDevice->setVisibility(L"Side");
+    AcDbExtents side;
+    CHECK_EQ(pDevice->getGeomExtents(side), Acad::eOk);
+    CHECK_POINT(side.minPoint(), AcGePoint3d(0.0, -100.0, 0.0));
+
+    // ...и преобразуется вместе с объектом.
+    pDevice->setScale(2.0);
+    AcDbExtents scaled;
+    CHECK_EQ(pDevice->getGeomExtents(scaled), Acad::eOk);
+    CHECK_POINT(scaled.minPoint(), AcGePoint3d(0.0, -200.0, 0.0));
+    CHECK_EQ(mock::liveResbufs, 0);
+
+    // Определение атрибута в границы не входит (как и в отрисовку).
+    addPlainBlock(L"DEVICE_01");
+    pDevice->setBlockName(L"DEVICE_01");
+    AcDbExtents plain;
+    CHECK_EQ(pDevice->getGeomExtents(plain), Acad::eOk);
+    CHECK(plain.minPoint().x > -1.0);
+}
+
+TEST(Stage3_Draw_SelfReferencingBlockDoesNotRecurse)
+{
+    mock::reset();
+    // Блок LOOP содержит MyDevice, который показывает блок LOOP.
+    AcDbBlockTableRecord* pLoop = workingDb()->mockAddBlock(L"LOOP");
+    MyDevice* pInner = new MyDevice();
+    AcDbObjectId id;
+    pLoop->appendAcDbEntity(id, pInner);
+    pInner->setBlockName(L"LOOP");
+    MyDevice* pDevice = appendDevice();
+    pDevice->setBlockName(L"LOOP");
+
+    RecordingWorldDraw wd;
+    pDevice->worldDraw(&wd);
+    CHECK(!wd.depthExceeded);
+    // Внешний объект рисует вложенный MyDevice, тот блок LOOP повторно не рисует.
+    CHECK_EQ(wd.drawn.size(), static_cast<size_t>(1));
+    CHECK_EQ(wd.pushCalls, wd.popCalls);
+
+    AcDbExtents extents;
+    CHECK_EQ(pDevice->getGeomExtents(extents), Acad::eOk);
+    CHECK_BLOCK_CLOSED(pLoop);
+
+    // После отрисовки защита снята: следующий объект рисует блок как обычно.
+    RecordingWorldDraw again;
+    pDevice->worldDraw(&again);
+    CHECK_EQ(again.drawn.size(), static_cast<size_t>(1));
+}
+
+TEST(Stage3_List_ShowsBlockAndVisibility)
+{
+    mock::reset();
+    addDynamicBlock();
+    addPlainBlock(L"DEVICE_01");
+    MyDevice* pDevice = appendDevice();
+
+    pDevice->setBlockName(L"DEVICE_DYNAMIC");
+    pDevice->setVisibility(L"Side");
+    mock::printed.clear();
+    pDevice->list();
+    CHECK(printedContains(L"DEVICE_DYNAMIC"));
+    CHECK(printedContains(L"dynamic block"));
+    CHECK(printedContains(L"Side"));
+
+    pDevice->setBlockName(L"DEVICE_01");
+    mock::printed.clear();
+    pDevice->list();
+    CHECK(printedContains(L"DEVICE_01"));
+    CHECK(printedContains(L"block"));
+    CHECK(!printedContains(L"Visibility"));
+
+    pDevice->setBlockName(L"MISSING");
+    mock::printed.clear();
+    pDevice->list();
+    CHECK(printedContains(L"BLOCK NOT FOUND"));
+
+    pDevice->setBlockName(L"");
+    mock::printed.clear();
+    pDevice->list();
+    CHECK(printedContains(L"(none)"));
+    CHECK_EQ(mock::liveResbufs, 0);
+}
+
+TEST(Stage3_Properties_PaletteLayoutAndBlockList)
+{
+    mock::reset();
+    typedef MyDeviceProperties P;
+    // Категория MyDevice: BlockName, затем Visibility; тексты — по-прежнему 12 свойств.
+    CHECK_EQ(P::blockCount(), 2);
+    CHECK_WSTR(P::blockAt(P::kBlockName).category, L"MyDevice");
+    CHECK_WSTR(P::blockAt(P::kBlockName).name, L"BlockName");
+    CHECK_WSTR(P::blockAt(P::kVisibility).category, L"MyDevice");
+    CHECK_WSTR(P::blockAt(P::kVisibility).name, L"Visibility");
+    CHECK_EQ(P::count(), 12);
+
+    AcDbBlockTableRecord* pPaper = workingDb()->mockAddBlock(L"*Paper_Space");
+    pPaper->mockIsLayout = true;
+    addPlainBlock(L"DEVICE_01");
+    workingDb()->mockAddBlock(L"*U2")->mockIsAnonymous = true;
+    addDynamicBlock();
+    workingDb()->mockAddBlock(L"XREF_PLAN")->mockIsXref = true;
+
+    std::vector<AcString> names;
+    CHECK_EQ(P::blockNames(workingDb(), names), Acad::eOk);
+    CHECK_EQ(names.size(), static_cast<size_t>(2));
+    if (names.size() == 2)
+    {
+        CHECK_WSTR(names[0].kACharPtr(), L"DEVICE_01");
+        CHECK_WSTR(names[1].kACharPtr(), L"DEVICE_DYNAMIC");
+    }
+    // Чтение списка не меняет чертёж и закрывает записи.
+    CHECK_EQ(workingDb()->blockTable.addCalls, 0);
+    CHECK_EQ(workingDb()->blockTable.openCount(), workingDb()->blockTable.closeCount());
+    names.push_back(L"stale");
+    CHECK_EQ(P::blockNames(nullptr, names), Acad::eNullObjectPointer);
+    CHECK(names.empty());
+
+    // Вне чертежа объект ищет блок в рабочей базе.
+    MyDevice device;
+    CHECK_EQ(P::setBlockName(device, L"DEVICE_DYNAMIC"), Acad::eOk);
+    std::vector<AcString> states;
+    CHECK_EQ(P::visibilityStates(device, states), Acad::eOk);
+    CHECK_EQ(states.size(), static_cast<size_t>(2));
+    if (states.size() == 2)
+    {
+        CHECK_WSTR(states[0].kACharPtr(), L"Front");
+        CHECK_WSTR(states[1].kACharPtr(), L"Side");
+    }
+}
+
+TEST(Stage3_Command_CreatesDeviceWithoutBlock)
+{
+    mock::reset();
+    addPlainBlock(L"DEVICE_01");
+    mock::getPointValue = AcGePoint3d(1.0, 2.0, 0.0);
+    MyDeviceCommand();
+    CHECK_EQ(modelSpace().entities.size(), static_cast<size_t>(1));
+    if (modelSpace().entities.size() != 1)
+        return;
+    MyDevice* pCreated = MyDevice::cast(modelSpace().entities[0]);
+    CHECK(pCreated != nullptr);
+    if (pCreated)
+    {
+        CHECK(pCreated->blockName().isEmpty());
+        CHECK(pCreated->visibility().isEmpty());
+    }
 }
 
 int main()

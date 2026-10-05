@@ -1,4 +1,4 @@
-// MyDeviceProperties.cpp — чтение и запись свойств текстов MyDevice.
+// MyDeviceProperties.cpp — чтение и запись свойств MyDevice.
 #include "StdAfx.h"
 #include "MyDeviceProperties.h"
 
@@ -37,6 +37,18 @@ namespace
 
     const int kDescriptorCount = static_cast<int>(sizeof(kDescriptors) / sizeof(kDescriptors[0]));
 
+    const ACHAR kCategoryBlock[] = _T("MyDevice");
+
+    const MyDeviceProperties::BlockDescriptor kBlockDescriptors[] = {
+        { MyDeviceProperties::kBlockName, kCategoryBlock, _T("BlockName"),
+          _T("Блок, отображаемый внутри MyDevice; базовая точка блока — в начале координат MyDevice") },
+        { MyDeviceProperties::kVisibility, kCategoryBlock, _T("Visibility"),
+          _T("Состояние видимости Dynamic Block") },
+    };
+
+    const int kBlockDescriptorCount =
+        static_cast<int>(sizeof(kBlockDescriptors) / sizeof(kBlockDescriptors[0]));
+
     bool isValidTextIndex(int textIndex)
     {
         return textIndex >= 0 && textIndex < MyDevice::kTextCount;
@@ -63,6 +75,67 @@ const MyDeviceProperties::Descriptor& MyDeviceProperties::at(int index)
     if (index < 0 || index >= kDescriptorCount)
         index = 0;
     return kDescriptors[index];
+}
+
+int MyDeviceProperties::blockCount()
+{
+    return kBlockDescriptorCount;
+}
+
+const MyDeviceProperties::BlockDescriptor& MyDeviceProperties::blockAt(int index)
+{
+    if (index < 0 || index >= kBlockDescriptorCount)
+        index = 0;
+    return kBlockDescriptors[index];
+}
+
+AcString MyDeviceProperties::blockName(const MyDevice& device)
+{
+    return device.blockName();
+}
+
+Acad::ErrorStatus MyDeviceProperties::setBlockName(MyDevice& device, const AcString& name)
+{
+    return device.setBlockName(name);
+}
+
+bool MyDeviceProperties::hasVisibility(const MyDevice& device)
+{
+    MyDeviceBlock::Info info;
+    device.findBlock(info);
+    return info.hasVisibility;
+}
+
+AcString MyDeviceProperties::visibility(const MyDevice& device)
+{
+    // Сохранённое состояние, которого у блока больше нет, показывается как состояние по умолчанию —
+    // так же, как блок рисуется.
+    MyDeviceBlock::Info info;
+    device.findBlock(info);
+    if (!info.hasVisibility)
+        return AcString();
+    return info.states[static_cast<size_t>(info.effectiveState(device.visibility()))].name;
+}
+
+Acad::ErrorStatus MyDeviceProperties::setVisibility(MyDevice& device, const AcString& state)
+{
+    return device.setVisibility(state);
+}
+
+Acad::ErrorStatus MyDeviceProperties::visibilityStates(const MyDevice& device,
+                                                       std::vector<AcString>& states)
+{
+    states.clear();
+    MyDeviceBlock::Info info;
+    device.findBlock(info);
+    for (const MyDeviceBlock::State& state : info.states)
+        states.push_back(state.name);
+    return Acad::eOk;
+}
+
+Acad::ErrorStatus MyDeviceProperties::blockNames(AcDbDatabase* pDb, std::vector<AcString>& names)
+{
+    return MyDeviceBlock::names(pDb, names);
 }
 
 bool MyDeviceProperties::isNumeric(Field field)

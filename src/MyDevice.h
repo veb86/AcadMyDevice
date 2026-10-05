@@ -1,11 +1,12 @@
 // MyDevice.h — пользовательский объект MyDevice (наследник AcDbEntity).
 //
-// MyDevice хранит точку вставки, ориентацию и два текста (Text1, Text2)
-// и сам рисует прямоугольник 100x50 и оба текста в subWorldDraw(),
-// не создавая отдельных AcDbText/AcDbMText.
+// MyDevice хранит точку вставки, ориентацию, два текста (Text1, Text2) и имя блока
+// и сам рисует прямоугольник 100x50, блок и оба текста в subWorldDraw(),
+// не создавая отдельных AcDbText/AcDbMText/AcDbBlockReference.
 #pragma once
 
 #include "StdAfx.h"
+#include "MyDeviceBlock.h"
 
 // Параметры одного текста MyDevice.
 // Высота и положение задаются в локальной системе координат объекта:
@@ -28,14 +29,16 @@ public:
 
     // Версия формата данных MyDevice в DWG/DXF.
     // Увеличивать при каждом изменении набора сохраняемых полей.
-    // 1 — этап 1 (только строки Text1/Text2), 2 — полные свойства текстов.
-    static constexpr Adesk::Int16 kCurrentVersion = 2;
+    // 1 — этап 1 (только строки Text1/Text2), 2 — полные свойства текстов,
+    // 3 — имя блока и состояние видимости.
+    static constexpr Adesk::Int16 kCurrentVersion = 3;
 
     // Геометрия в локальной системе координат объекта (единицы чертежа).
     static const double kWidth;       // ширина прямоугольника
     static const double kHeight;      // высота прямоугольника
     static const double kTextHeight;  // высота текста по умолчанию
     static const double kTextMargin;  // отступ текста от левого края по умолчанию
+    static const double kNotFoundTextHeight; // высота надписи «BLOCK NOT FOUND»
 
     // Номера текстов для textAt()/setTextAt().
     enum TextIndex { kText1 = 0, kText2 = 1, kTextCount = 2 };
@@ -77,6 +80,28 @@ public:
     // Параметры текста по умолчанию (как на этапе 1).
     static MyDeviceText defaultText(int index);
 
+    // Имя блока, который показывается внутри MyDevice; пустое — блока нет.
+    // Базовая точка блока совпадает с началом локальной системы координат объекта,
+    // блок перемещается, поворачивается и масштабируется вместе с ним.
+    // setBlockName() принимает и имя отсутствующего блока (показывается «BLOCK NOT FOUND»)
+    // и сбрасывает Visibility в состояние по умолчанию нового блока (или в пустую
+    // строку, если у блока нет параметра видимости). Повторный выбор того же блока
+    // сохраняет текущее состояние.
+    AcString blockName() const;
+    Acad::ErrorStatus setBlockName(const AcString& name);
+
+    // Сохранённое состояние видимости Dynamic Block (пустое — параметра видимости нет).
+    // Это не самостоятельный параметр: если состояния с таким именем в блоке уже нет,
+    // показывается состояние по умолчанию (см. MyDeviceBlock::Info::effectiveState).
+    // setVisibility():
+    //  * eNotApplicable — у блока нет параметра видимости (или блок не найден);
+    //  * eInvalidInput — такого состояния у блока нет; объект при этом не меняется.
+    AcString visibility() const;
+    Acad::ErrorStatus setVisibility(const AcString& state);
+
+    // Блок BlockName в базе данных объекта (или в рабочей, если объект не в чертеже).
+    Acad::ErrorStatus findBlock(MyDeviceBlock::Info& info) const;
+
     // Матрица перехода из локальной системы координат объекта в МСК.
     AcGeMatrix3d localToWorld() const;
 
@@ -110,9 +135,21 @@ private:
     // Рисует один текст его стилем и на его слое.
     void drawText(AcGiWorldDraw* pWd, AcDbDatabase* pDb, const MyDeviceText& text) const;
 
+    // Рисует блок BlockName (или «BLOCK NOT FOUND») на слое объекта.
+    void drawBlock(AcGiWorldDraw* pWd, AcDbDatabase* pDb) const;
+
+    // База данных объекта, а если он ещё не добавлен в чертёж — рабочая.
+    AcDbDatabase* databaseOrWorking() const;
+
+    // Матрица перехода из системы координат определения блока в МСК:
+    // базовая точка блока попадает в начало локальной системы координат объекта.
+    AcGeMatrix3d blockToWorld(const MyDeviceBlock::Info& info) const;
+
     AcGePoint3d  m_position;
     AcGeVector3d m_xDirection;
     AcGeVector3d m_normal;
     double       m_scale;
     MyDeviceText m_texts[kTextCount];
+    AcString     m_blockName;
+    AcString     m_visibility;
 };
